@@ -31,15 +31,15 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=2.4.1",
-    "opencv-contrib-python>=4.13.0.90",
+    "numpy>=1.21.0",
+    "opencv-contrib-python>=4.10.0",
     "pyzbar>=0.1.9",
 ]
 
 [project.optional-dependencies]
-yolo = ["ultralytics>=8.4.7"]
+yolo = ["ultralytics>=8.3.0"]
 ros = ["rospy", "cv-bridge", "sensor-msgs"]
-all = ["ultralytics>=8.4.7", "rospy", "cv-bridge", "sensor-msgs"]
+all = ["ultralytics>=8.3.0", "rospy", "cv-bridge", "sensor-msgs"]
 
 [project.urls]
 Homepage = "https://github.com/optimatorlab/ub_code"

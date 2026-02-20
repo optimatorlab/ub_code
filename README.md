@@ -50,10 +50,10 @@ The installation order is critical because `ultralytics` may install `opencv-pyt
 
 ```bash
 # Install numpy
-pip install "numpy>=2.4.1"
+pip install "numpy>=1.21.0"
 
 # Install ultralytics (for YOLO object detection)
-pip install "ultralytics>=8.4.7"
+pip install "ultralytics>=8.3.0"
 
 # Uninstall opencv-python (ultralytics may have installed this)
 # The -y flag auto-confirms, so this is safe to copy-paste
@@ -64,7 +64,7 @@ pip uninstall -y opencv-python
 pip uninstall -y opencv-contrib-python
 
 # Install opencv-contrib-python (required for ArUco markers, face detection, etc.)
-pip install "opencv-contrib-python>=4.13.0.90"
+pip install "opencv-contrib-python>=4.10.0"
 
 # Install pyzbar (for barcode/QR code detection)
 pip install "pyzbar>=0.1.9"
