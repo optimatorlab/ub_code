@@ -1,2 +1,2 @@
 """Version information for ub-code package."""
-__version__ = "2026.2.20.1"
+__version__ = "2026.2.20.2"
