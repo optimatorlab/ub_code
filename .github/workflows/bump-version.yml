@@ -20,8 +20,13 @@ jobs:
       - name: Compute new version
         id: version
         run: |
-          TODAY=$(date -u +%Y-%m-%d)
-          CURRENT=$(grep -oP '__version__ = "\K[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+(?=")' ub_camera/_version.py)
+          # PEP 440 compliant date format: YYYY.M.D.N (no leading zeros, no hyphens)
+          YEAR=$(date -u +%Y)
+          MONTH=$(date -u +%-m)  # %-m removes leading zero
+          DAY=$(date -u +%-d)    # %-d removes leading zero
+          TODAY="$YEAR.$MONTH.$DAY"
+
+          CURRENT=$(grep -oP '__version__ = "\K[0-9.]+(?=")' ub_camera/_version.py)
           CURRENT_DATE=${CURRENT%.*}
           CURRENT_INC=${CURRENT##*.}
 
