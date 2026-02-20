@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ub-code"
+dynamic = ["version"]
+description = "Unified Camera Interface and Utilities from Optimator Lab"
+authors = [{name = "Optimator Lab"}]
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+keywords = ["camera", "opencv", "aruco", "computer-vision", "ros", "yolo", "streaming", "barcode", "qr-code", "face-detection"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "numpy>=2.4.1",
+    "opencv-contrib-python>=4.13.0.90",
+    "pyzbar>=0.1.9",
+]
+
+[project.optional-dependencies]
+yolo = ["ultralytics>=8.4.7"]
+ros = ["rospy", "cv-bridge", "sensor-msgs"]
+all = ["ultralytics>=8.4.7", "rospy", "cv-bridge", "sensor-msgs"]
+
+[project.urls]
+Homepage = "https://github.com/optimatorlab/ub_code"
+Repository = "https://github.com/optimatorlab/ub_code"
+Issues = "https://github.com/optimatorlab/ub_code/issues"
+Documentation = "https://github.com/optimatorlab/ub_code#readme"
+
+[tool.setuptools]
+packages = ["ub_camera", "ub_utils"]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "ub_camera._version.__version__"}
+
+[tool.setuptools.package-data]
+ub_camera = ["ssl/*.crt", "ssl/*.key"]
