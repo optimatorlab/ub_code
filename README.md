@@ -116,7 +116,9 @@ ub_camera.checkVersion()
 # Current version: 2025-02-19.0
 # Latest version:  2025-02-20.1
 # ⚠ Update available! Run: pip install --upgrade ub-code
+```
 
+```python
 # Or use silently for programmatic checks
 current, latest, is_up_to_date = ub_camera.checkVersion(verbose=False)
 if not is_up_to_date:
@@ -194,6 +196,7 @@ camera = ub_camera.CameraUSB(paramDict = paramDict,
 camera.start(startStream=True, port=paramDict['outputPort'])
 
 print(f'Visit https://localhost:{paramDict["outputPort"]}/stream.mjpg')
+print("When you're done, be sure to stop the camera: camera.stop()")
 ```
 - **Before you exit, make sure you stop your camera.**  See code below.
 
