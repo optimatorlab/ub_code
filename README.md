@@ -24,18 +24,23 @@ Or download the ZIP file from [https://github.com/optimatorlab/ub_code](https://
 >
 > Before installing dependencies, create and activate a virtual environment to isolate this package and its dependencies from your system Python:
 >
-> ```bash
-> # Create a virtual environment (replace 'ub_code_env' with any name you prefer)
-> python3 -m venv ub_code_env
+> - Create a virtual environment (replace 'ub_code_env' with any name you prefer)
+>     ```bash
+>     python3 -m venv ub_code_env
+>     ```
 >
-> # Activate it:
-> # On Linux/Mac:
-> source ub_code_env/bin/activate
-> # On Windows:
-> ub_code_env\Scripts\activate
+> - Linux/Mac -- Activate virtual environment:
+>     ```bash
+>     source ub_code_env/bin/activate
+>     ```
 >
-> # Your prompt should now show (ub_code_env)
-> ```
+> - Windows -- Activate virtual environment:
+>     ```bash
+>     ub_code_env\Scripts\activate
+>     ```
+>
+> Your prompt should now show `(ub_code_env)`
+>
 >
 > This prevents conflicts with other Python packages on your system and makes it easy to manage dependencies.
 
