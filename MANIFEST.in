@@ -1,0 +1,4 @@
+include README.md
+include pyproject.toml
+recursive-include ssl *.crt *.key *.der.crt
+recursive-include cv2_dnn_models *.prototxt *.caffemodel *.pbtxt *.pb

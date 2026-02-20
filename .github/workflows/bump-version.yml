@@ -1,0 +1,47 @@
+name: Bump Version
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+
+    if: "!contains(github.event.head_commit.message, 'bump version')"
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute new version
+        id: version
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          CURRENT=$(grep -oP '__version__ = "\K[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+(?=")' ub_camera/_version.py)
+          CURRENT_DATE=${CURRENT%.*}
+          CURRENT_INC=${CURRENT##*.}
+
+          if [ "$CURRENT_DATE" = "$TODAY" ]; then
+            NEW_INC=$((CURRENT_INC + 1))
+          else
+            NEW_INC=0
+          fi
+
+          NEW_VERSION="$TODAY.$NEW_INC"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update _version.py
+        run: |
+          sed -i 's/__version__ = ".*"/__version__ = "${{ steps.version.outputs.new_version }}"/' ub_camera/_version.py
+
+      - name: Commit and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ub_camera/_version.py
+          git commit -m "bump version to ${{ steps.version.outputs.new_version }}"
+          git push
