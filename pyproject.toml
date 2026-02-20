@@ -55,4 +55,11 @@ include-package-data = true
 version = {attr = "ub_camera._version.__version__"}
 
 [tool.setuptools.package-data]
-ub_camera = ["ssl/*.crt", "ssl/*.key"]
+ub_camera = [
+    "ssl/*.crt",
+    "ssl/*.key",
+    "cv2_dnn_models/*.prototxt",
+    "cv2_dnn_models/*.caffemodel",
+    "cv2_dnn_models/*.pbtxt",
+    "cv2_dnn_models/*.pb",
+]

@@ -36,3 +36,16 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Custom ignore patterns
+# Ignore files starting with zzz_
+zzz_*
+
+# Jupyter notebooks checkpoints
+**/.ipynb_checkpoints
+
+# Python compiled files (additional pattern)
+**/*.pyc
+
+# PyTorch model files
+**/*.pt

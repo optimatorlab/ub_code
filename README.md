@@ -75,6 +75,32 @@ import ub_utils
 - Both opencv-python and opencv-contrib-python cannot be installed simultaneously
 - opencv-contrib-python includes all functionality of opencv-python plus additional modules
 
+---
+
+## Checking for Updates
+
+You can check if you have the latest version installed:
+
+```python
+import ub_camera
+
+# Check version and get update notification
+ub_camera.checkVersion()
+# Output:
+# Current version: 2025-02-19.0
+# Latest version:  2025-02-20.1
+# ⚠ Update available! Run: pip install --upgrade ub-code
+
+# Or use silently for programmatic checks
+current, latest, is_up_to_date = ub_camera.checkVersion(verbose=False)
+if not is_up_to_date:
+    print(f"Please update from {current} to {latest}")
+```
+
+The function compares your installed version against the latest version on the GitHub main branch.
+
+---
+
 ## Using Custom SSL Certificates
 
 The package includes self-signed SSL certificates for HTTPS streaming (useful for development/testing). To use your own SSL certificates instead:

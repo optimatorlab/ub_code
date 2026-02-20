@@ -30,6 +30,10 @@ Dependencies:
     - ub_utils (custom utility module)
 
 Basic Usage:
+    # Check for updates
+    import ub_camera
+    ub_camera.checkVersion()
+
     # USB Camera
     camera = CameraUSB(paramDict={'res_rows': 480, 'res_cols': 640, 'fps_target': 30})
     camera.start()
@@ -68,6 +72,80 @@ from collections import deque
 from pathlib import Path
 
 import ub_utils				# A bunch of (somewhat) helpful functions and variables
+
+
+def checkVersion(verbose=True):
+	"""
+	Check if the installed version of ub_camera matches the latest version on GitHub.
+
+	Args:
+		verbose (bool): If True, prints status messages. If False, returns tuple silently.
+
+	Returns:
+		tuple: (current_version, latest_version, is_up_to_date)
+			- current_version (str): Currently installed version
+			- latest_version (str): Latest version on GitHub main branch
+			- is_up_to_date (bool): True if versions match, False if update available
+
+	Example:
+		>>> import ub_camera
+		>>> ub_camera.checkVersion()
+		Current version: 2025-02-19.0
+		Latest version:  2025-02-20.1
+		⚠ Update available! Run: pip install --upgrade ub-code
+
+		>>> current, latest, up_to_date = ub_camera.checkVersion(verbose=False)
+	"""
+	try:
+		import urllib.request
+		import re
+
+		current_version = __version__
+
+		# Fetch the _version.py file from GitHub main branch
+		url = "https://raw.githubusercontent.com/optimatorlab/ub_code/main/ub_camera/_version.py"
+
+		try:
+			with urllib.request.urlopen(url, timeout=5) as response:
+				content = response.read().decode('utf-8')
+
+			# Parse the version from the file
+			match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+			if match:
+				latest_version = match.group(1)
+			else:
+				if verbose:
+					print("⚠ Could not parse version from GitHub")
+				return (current_version, None, None)
+
+		except urllib.error.URLError as e:
+			if verbose:
+				print(f"⚠ Could not fetch latest version from GitHub: {e}")
+			return (current_version, None, None)
+		except Exception as e:
+			if verbose:
+				print(f"⚠ Error checking version: {e}")
+			return (current_version, None, None)
+
+		# Compare versions
+		is_up_to_date = (current_version == latest_version)
+
+		if verbose:
+			print(f"Current version: {current_version}")
+			print(f"Latest version:  {latest_version}")
+
+			if is_up_to_date:
+				print("✓ You have the latest version!")
+			else:
+				print("⚠ Update available! Run: pip install --upgrade ub-code")
+				print("  Or for development mode: cd <ub_code-dir> && git pull")
+
+		return (current_version, latest_version, is_up_to_date)
+
+	except Exception as e:
+		if verbose:
+			print(f"Error in checkVersion: {e}")
+		return (__version__, None, None)
 
 # This stuff is for streaming only:
 # ------------------------------------------------
@@ -961,7 +1039,9 @@ class _FaceDetect():
 			if (modelPath):
 				self.modelPath = modelPath
 			else:
-				self.modelPath = f'{os.getcwd()}/cv2_dnn_models'  # Place where deploy.prototxt, res10_300x300_....caffemodel are saved
+				# Use DNN models from the package installation directory
+				module_dir = os.path.dirname(os.path.abspath(__file__))
+				self.modelPath = os.path.join(module_dir, 'cv2_dnn_models')
 
 
 			self.color = color
