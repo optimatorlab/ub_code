@@ -90,14 +90,15 @@ def checkVersion(verbose=True):
 	Example:
 		>>> import ub_camera
 		>>> ub_camera.checkVersion()
-		Current version: 2025-02-19.0
-		Latest version:  2025-02-20.1
+		Current version: 2026.2.20.0
+		Latest version:  2026.2.20.1
 		⚠ Update available! Run: pip install --upgrade ub-code
 
 		>>> current, latest, up_to_date = ub_camera.checkVersion(verbose=False)
 	"""
 	try:
 		import urllib.request
+		import ssl
 		import re
 
 		current_version = __version__
@@ -106,7 +107,11 @@ def checkVersion(verbose=True):
 		url = "https://raw.githubusercontent.com/optimatorlab/ub_code/main/ub_camera/_version.py"
 
 		try:
-			with urllib.request.urlopen(url, timeout=5) as response:
+			# Use unverified SSL context for simplicity
+			# (We're just reading a public version file, no sensitive data)
+			context = ssl._create_unverified_context()
+
+			with urllib.request.urlopen(url, timeout=5, context=context) as response:
 				content = response.read().decode('utf-8')
 
 			# Parse the version from the file
