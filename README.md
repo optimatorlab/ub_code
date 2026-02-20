@@ -20,7 +20,28 @@ Or download the ZIP file from [https://github.com/optimatorlab/ub_code](https://
 
 ### Step 1: Install Core Dependencies
 
+> **⚠️ STRONGLY RECOMMENDED: Use a Python Virtual Environment**
+>
+> Before installing dependencies, create and activate a virtual environment to isolate this package and its dependencies from your system Python:
+>
+> ```bash
+> # Create a virtual environment (replace 'ub_code_env' with any name you prefer)
+> python3 -m venv ub_code_env
+>
+> # Activate it:
+> # On Linux/Mac:
+> source ub_code_env/bin/activate
+> # On Windows:
+> ub_code_env\Scripts\activate
+>
+> # Your prompt should now show (ub_code_env)
+> ```
+>
+> This prevents conflicts with other Python packages on your system and makes it easy to manage dependencies.
+
 The installation order is critical because `ultralytics` may install `opencv-python`, but we need `opencv-contrib-python` for ArUco marker support.
+
+**You can safely copy and paste this entire block:**
 
 ```bash
 # Install numpy
@@ -30,12 +51,12 @@ pip install "numpy>=2.4.1"
 pip install "ultralytics>=8.4.7"
 
 # Uninstall opencv-python (ultralytics may have installed this)
-pip uninstall opencv-python
-# Answer 'y' if prompted
+# The -y flag auto-confirms, so this is safe to copy-paste
+pip uninstall -y opencv-python
 
 # Uninstall opencv-contrib-python (in case it's already installed)
-pip uninstall opencv-contrib-python
-# Answer 'y' if prompted (you may get a warning that it's not installed - that's OK)
+# You may see a warning if it's not installed - that's OK
+pip uninstall -y opencv-contrib-python
 
 # Install opencv-contrib-python (required for ArUco markers, face detection, etc.)
 pip install "opencv-contrib-python>=4.13.0.90"
