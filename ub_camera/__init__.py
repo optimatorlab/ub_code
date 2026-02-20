@@ -2005,10 +2005,12 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 		if (len(self.camObject.ipAllowlist) > 0):
 			if (self.client_address[0] not in self.camObject.ipAllowlist):
 				self._error()
+				return
 		elif (len(self.camObject.ipBlocklist) > 0):
 			if (self.client_address[0] in self.camObject.ipBlocklist):
 				self._error()
-		elif (self.path == '/stream.mjpg'):
+				return
+		if (self.path == '/stream.mjpg'):
 			self.send_response(200)
 			self.send_header('Age', 0)
 			self.send_header('Cache-Control', 'no-cache, private')
@@ -2019,6 +2021,9 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 				self.camObject.streamIncr(+1)
 				# print(f'DEBUG: keepStreaming? {self.camObject.keepStreaming}')
 				while self.camObject.keepStreaming:
+					if (len(self.camObject.ipAllowlist) > 0) and (self.client_address[0] not in self.camObject.ipAllowlist):
+						self.camObject.streamIncr(-1)
+						break
 					with self.camObject.condition:
 						success = self.camObject.condition.wait(STREAM_MAX_WAIT_TIME_SEC)
 					
@@ -2194,12 +2199,12 @@ class Camera():
 					'publish': _make_fps_dict(recheckInterval=5)}
 		self.showFPS = showFPS
 		
-		self.ipAllowlist = ipAllowlist
-		self.ipBlocklist = ipBlocklist
-				
+		self.ipAllowlist = list(ipAllowlist)
+		self.ipBlocklist = list(ipBlocklist)
+
 		self.condition = Condition()		# FIXME -- Can we call this self.frameReadyCondition?  NOTE:  This is referenced by camAutoTakePic...If you change names check there, too.
-	
-		self.frameDeque = deque(maxlen=1) 
+
+		self.frameDeque = deque(maxlen=1)
 
 		self.camOn = False		# FIXME -- Group the flags together
 		
@@ -2229,6 +2234,23 @@ class Camera():
 		if (initROSnode):
 			self._init_ros_node()
 			
+	# ── IP allowlist helpers ──────────────────────────────────────────────────
+	def set_allowlist(self, ips):
+		"""Replace the IP allowlist entirely. Pass an empty list to allow all IPs."""
+		self.ipAllowlist = list(ips)
+
+	def add_to_allowlist(self, ip):
+		"""Add a single IP to the allowlist if not already present."""
+		if ip and ip not in self.ipAllowlist:
+			self.ipAllowlist.append(ip)
+
+	def remove_from_allowlist(self, ip):
+		"""Remove a single IP from the allowlist (no-op if not present)."""
+		try:
+			self.ipAllowlist.remove(ip)
+		except ValueError:
+			pass
+
 	def _getIntrinsics(self):
 		'''
 		Clean up self.intrinsics, which is populated from the input parameters dictionary.
