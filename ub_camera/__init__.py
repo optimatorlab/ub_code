@@ -2859,6 +2859,46 @@ class Camera():
 		
 	
 	
+	def addCircle(self, center, radius, thickness=3, color=(150, 25, 25)):
+		'''
+		Add a circle overlay to the video stream.
+
+		Returns (decorationID, params) where params is a mutable dict.
+		Modify params['center'], params['radius'], etc. to update dynamically.
+		Call camera.removeDecoration(decorationID) to remove.
+		'''
+		params = {'center': center, 'radius': radius, 'thickness': thickness, 'color': color}
+		decorationID = int(time.time() * 1000)
+
+		def _decorate(img, **kwargs):
+			ub_utils.drawCircle(img, params['center'], params['radius'], params['thickness'], params['color'])
+
+		self.dec['dequeAdd'].append({'function': _decorate, 'idName': f'circle_{decorationID}', 'decorationID': decorationID})
+		return (decorationID, params)
+
+	def addText(self, text, position, fontScale=0.7, thickness=2, color=(255, 255, 255)):
+		'''
+		Add a text overlay to the video stream.
+
+		Returns (decorationID, params) where params is a mutable dict.
+		Modify params['text'], params['position'], etc. to update dynamically.
+		Call camera.removeDecoration(decorationID) to remove.
+		'''
+		params = {'text': text, 'position': position, 'fontScale': fontScale, 'thickness': thickness, 'color': color}
+		decorationID = int(time.time() * 1000)
+
+		def _decorate(img, **kwargs):
+			ub_utils.drawText(img, params['text'], params['position'], params['fontScale'], params['thickness'], params['color'])
+
+		self.dec['dequeAdd'].append({'function': _decorate, 'idName': f'text_{decorationID}', 'decorationID': decorationID})
+		return (decorationID, params)
+
+	def removeDecoration(self, decorationID):
+		'''
+		Remove a decoration (circle, text, etc.) by its decorationID.
+		'''
+		self.dec['dequeRemove'].append(decorationID)
+
 	def manageDecorationsDeque(self):			
 		# Add from decorations request add deque
 		while self.dec['dequeAdd']:
