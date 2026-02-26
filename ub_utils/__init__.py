@@ -677,6 +677,20 @@ def drawCircle(img, center, radius, thickness=3, color=(150, 25, 25)):
 def drawLine(img, p1, p2, thickness=3, color=(255,0,0)):
 	cv2.line(img, p1, p2, color, thickness, cv2.LINE_AA)
 
+def drawText(img, text, position, fontScale=0.7, thickness=2, color=(255, 255, 255), font=cv2.FONT_HERSHEY_SIMPLEX):
+	'''
+	cv2.putText(img, text, org, fontFace, fontScale, color, thickness, lineType)
+
+	img (CvArr) – Image where the text is drawn
+	text (str) – Text string to be drawn
+	position (tuple) – Bottom-left corner of the text string in the image (x, y)
+	fontScale (float) – Font scale factor
+	thickness (int) – Thickness of the lines used to draw the text
+	color (CvScalar) – Text color
+	font (int) – Font type (e.g., cv2.FONT_HERSHEY_SIMPLEX)
+	'''
+	cv2.putText(img, text, position, font, fontScale, color, thickness, cv2.LINE_AA)
+
 
 def res2rowscols(res):
 	'''

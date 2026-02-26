@@ -615,7 +615,49 @@ camera.addTimelapse(outputDir        = 'timelapse_photos',
 camera.timelapse['default'].stop()
 ```                    
 
---- 
+---
+
+### Circle and Text Overlays
+
+You can add circle and text overlays to the video stream. Both return a `(decorationID, params)` tuple. The `params` dict is mutable — update its values to change the overlay dynamically each frame.
+
+#### Circle
+```python
+# Add a circle at (center_x, center_y) with radius 50
+cid, circle_params = camera.addCircle(center=(320, 240), radius=50, thickness=3, color=(150, 25, 25))
+```
+
+```python
+# Move the circle dynamically:
+circle_params['center'] = (400, 300)
+circle_params['radius'] = 75
+circle_params['color'] = (0, 255, 0)
+```
+
+```python
+# Remove the circle:
+camera.removeDecoration(cid)
+```
+
+#### Text
+```python
+# Add text at position (x, y)
+tid, text_params = camera.addText(text="Hello", position=(100, 100), fontScale=0.7, thickness=2, color=(255, 255, 255))
+```
+
+```python
+# Update the text dynamically:
+text_params['text'] = "World"
+text_params['position'] = (200, 200)
+text_params['color'] = (0, 0, 255)
+```
+
+```python
+# Remove the text:
+camera.removeDecoration(tid)
+```
+
+---
 
 ### Video from Pics
 - TBD.  First, run timelapse to save photos to a directory, then process the photos in that directory into an `.mpeg` video.
