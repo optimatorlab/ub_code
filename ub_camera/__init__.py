@@ -2104,9 +2104,10 @@ class Camera():
 		facedetect (dict): Active face detection instances.
 		ultralytics (dict): Active Ultralytics YOLO model instances.
 		zoomLevel (float): Current digital zoom level (1.0 = no zoom).
-		keepStreaming (bool): Flag to control HTTPS streaming thread.
+		keepStreaming (bool): Flag to control the active streaming thread.
+		activeProtocol (str): Currently active streaming protocol ('mjpeg', 'websocket', 'webrtc'), or None.
 		keepPublishing (bool): Flag to control ROS publishing thread.
-		numStreams (int): Count of active HTTPS stream connections.
+		numStreams (int): Count of active stream connections.
 		frameDeque (deque): Thread-safe deque holding the most recent captured frame.
 		condition (Condition): Threading condition variable for frame synchronization.
 		logger (Logger): Logging instance for recording events and errors.
@@ -2208,8 +2209,9 @@ class Camera():
 
 		self.camOn = False		# FIXME -- Group the flags together
 		
-		self.numStreams	    = 0
-		self.keepStreaming  = False
+		self.numStreams      = 0
+		self.keepStreaming   = False
+		self.activeProtocol = None   # 'mjpeg' | 'websocket' | 'webrtc'
 		
 		self.keepPublishing = False   # _thread_ros
 		self.hasROSnode = False	
@@ -2638,39 +2640,68 @@ class Camera():
 				
 
 						
-	def startStream(self, port):
-		"""Start HTTPS video streaming server on the specified port.
+	def startStream(self, port, protocol='mjpeg', force=False, signalingMode='html'):
+		"""Start a video streaming server on the specified port.
 
-		Launches a threaded HTTPS server that streams camera frames as MJPEG to connected
-		clients. Uses SSL/TLS encryption with certificates from sslPath.
+		Launches a threaded server that streams camera frames to connected clients.
+		Only one protocol may be active at a time. Raises RuntimeError if a stream
+		is already running unless force=True, which stops the current stream first.
 
 		Args:
 			port (int): TCP port number for the streaming server.
+			protocol (str): Streaming protocol. One of 'mjpeg' (default),
+				'websocket', or 'webrtc'.
+			force (bool): If True, stop any currently active stream before starting
+				the new one. Default False.
+			signalingMode (str): WebRTC only. 'html' (default) serves a built-in
+				HTML+JS page at GET /webrtc. 'json' returns a JSON descriptor
+				instead, for integration into custom UIs.
 
 		Notes:
-			- Server runs in a daemon thread and will stop when the main program exits.
+			- Server runs in a daemon thread and stops when the main program exits.
 			- Multiple clients can connect simultaneously (tracked via numStreams).
 			- Frames are decorated with overlays (FPS, ArUco markers, etc.) before streaming.
 			- IP filtering is applied based on ipAllowlist and ipBlocklist.
 		"""
 		try:
-			self.keepStreaming = True
+			_VALID_PROTOCOLS = ('mjpeg', 'websocket', 'webrtc')
+			if protocol not in _VALID_PROTOCOLS:
+				raise ValueError(f"Invalid protocol '{protocol}'. Choose from {_VALID_PROTOCOLS}.")
 
-			strThread = threading.Thread(target=self._thread_stream, args=(port,))
+			if self.keepStreaming:
+				if force:
+					self.stopStream()
+				else:
+					raise RuntimeError(
+						f"A '{self.activeProtocol}' stream is already active on this camera. "
+						"Call stopStream() first, or pass force=True to replace it.")
+
+			self.keepStreaming   = True
+			self.activeProtocol = protocol
+
+			if protocol == 'mjpeg':
+				strThread = threading.Thread(target=self._thread_stream_mjpeg, args=(port,))
+			elif protocol == 'websocket':
+				strThread = threading.Thread(target=self._thread_stream_websocket, args=(port,))
+			elif protocol == 'webrtc':
+				strThread = threading.Thread(target=self._thread_stream_webrtc, args=(port, signalingMode))
+
 			strThread.daemon = True
 			strThread.start()
 		except Exception as e:
-			# raise Exception(f'Error in startStream: {e}')
-			self.keepStreaming = False
+			self.keepStreaming   = False
+			self.activeProtocol = None
 			self.logger.log(f'Error in startStream: {e}.', severity=ub_utils.SEVERITY_ERROR)
 
 	def stopStream(self):
-		"""Stop the HTTPS video streaming server.
+		"""Stop the active video streaming server.
 
-		Sets the keepStreaming flag to False, causing the streaming thread to terminate.
+		Sets keepStreaming to False, causing the streaming thread to terminate,
+		and clears the active protocol.
 		"""
 		try:
-			self.keepStreaming = False
+			self.keepStreaming   = False
+			self.activeProtocol = None
 		except Exception as e:
 			self.logger.log(f'Error in stopStream: {e}.', severity=ub_utils.SEVERITY_ERROR)
 
@@ -3061,17 +3092,17 @@ class Camera():
 			# raise Exception(f'_thread_ros error: {e}')
 			self.logger.log(f'_thread_ros error: {e}.', severity=ub_utils.SEVERITY_ERROR)
 				
-	def _thread_stream(self, portNumber):
+	def _thread_stream_mjpeg(self, portNumber):
 		'''
 		THIS IS A THREAD
-		It starts/runs the streaming server
-		'''			
+		It starts/runs the MJPEG streaming server
+		'''
 		try:
-			try:				
+			try:
 				address = ('', portNumber)
 				handler = partial(StreamingHandler, self)				# self --> This CamUSB instance
-				server = StreamingServer(address, handler)	
-				
+				server = StreamingServer(address, handler)
+
 				# --- make this server secure (ssl/https) ---
 				if ((sys.version_info.major == 3) and (sys.version_info.minor <= 7)):
 					# ssl.wrap_socket was deprecated in Python 3.7
@@ -3079,8 +3110,8 @@ class Camera():
 					server.socket = ssl.wrap_socket(
 						server.socket,
 						keyfile  = f'{self.sslPath}/ca.key',
-						certfile = f'{self.sslPath}/ca.crt',		
-						server_side=True)   
+						certfile = f'{self.sslPath}/ca.crt',
+						server_side=True)
 				else:
 					# This is the newer way:
 					ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -3089,16 +3120,32 @@ class Camera():
 						certfile = f'{self.sslPath}/ca.crt')
 					server.socket = ssl_context.wrap_socket(server.socket, server_side = True)
 				# -------------------------------------------
-				
-				server.serve_forever()	
-					
+
+				server.serve_forever()
+
 			finally:
-				self.logger.log('stopping _thread_stream thread', severity=ub_utils.SEVERITY_INFO)
-				# self.stop()
-					
+				self.logger.log('stopping _thread_stream_mjpeg thread', severity=ub_utils.SEVERITY_INFO)
+
 		except Exception as e:
-			# raise Exception(f'_thread_stream error: {e}')
-			self.logger.log(f'_thread_stream error: {e}.', severity=ub_utils.SEVERITY_ERROR)	
+			self.logger.log(f'_thread_stream_mjpeg error: {e}.', severity=ub_utils.SEVERITY_ERROR)
+
+	def _thread_stream_websocket(self, portNumber):
+		'''
+		THIS IS A THREAD
+		Placeholder — implemented in Step 2.
+		'''
+		self.logger.log('WebSocket streaming not yet implemented.', severity=ub_utils.SEVERITY_WARNING)
+		self.keepStreaming   = False
+		self.activeProtocol = None
+
+	def _thread_stream_webrtc(self, portNumber, signalingMode):
+		'''
+		THIS IS A THREAD
+		Placeholder — implemented in Step 3.
+		'''
+		self.logger.log('WebRTC streaming not yet implemented.', severity=ub_utils.SEVERITY_WARNING)
+		self.keepStreaming   = False
+		self.activeProtocol = None	
 			
 			
 	def _zoomFunction_cv2(self, frame):
