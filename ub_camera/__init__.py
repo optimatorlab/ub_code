@@ -154,6 +154,7 @@ def checkVersion(verbose=True):
 
 # This stuff is for streaming only:
 # ------------------------------------------------
+import asyncio
 import socketserver
 from functools import partial
 from threading import Condition
@@ -161,6 +162,12 @@ from http import server
 import ssl
 
 STREAM_MAX_WAIT_TIME_SEC = 2  # max time (in seconds) we wait for condition
+
+try:
+	import websockets
+	_HAS_WEBSOCKETS = True
+except ImportError:
+	_HAS_WEBSOCKETS = False
 # ------------------------------------------------
 
 # This stuff is for ROS only:
@@ -2068,7 +2075,101 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
 	allow_reuse_address = True
 	daemon_threads = True
 
-		
+
+class WebSocketStreamingServer:
+	"""Asyncio-based WebSocket server for broadcasting JPEG frames.
+
+	Maintains a set of connected WebSocket clients and broadcasts each new
+	camera frame to all of them as a binary JPEG message. Runs within a
+	single asyncio event loop that lives in its own daemon thread, fully
+	isolated from the main threading model.
+
+	IP allowlist and blocklist are enforced on connection and re-checked
+	on every frame broadcast.
+	"""
+
+	def __init__(self, camObject):
+		"""Initialize the server with a reference to the parent camera.
+
+		Args:
+			camObject: Camera instance providing frameDeque, condition,
+				decorateFrame(), and access-control lists.
+		"""
+		self.camObject = camObject
+		self.clients   = set()   # connected websockets.ServerConnection objects
+
+	def _is_blocked(self, ip):
+		"""Return True if the given IP address should be denied access."""
+		if self.camObject.ipAllowlist and ip not in self.camObject.ipAllowlist:
+			return True
+		if ip in self.camObject.ipBlocklist:
+			return True
+		return False
+
+	async def _handler(self, websocket):
+		"""Manage one client connection lifecycle.
+
+		Called by websockets.serve() for each new connection. Checks IP
+		access, registers the client, and waits for the connection to close.
+		"""
+		client_ip = websocket.remote_address[0]
+		if self._is_blocked(client_ip):
+			await websocket.close(1008, 'Access denied')
+			return
+		self.clients.add(websocket)
+		self.camObject.streamIncr(+1)
+		try:
+			await websocket.wait_closed()
+		finally:
+			self.clients.discard(websocket)
+			self.camObject.streamIncr(-1)
+
+	def _wait_for_frame(self):
+		"""Block until the next frame is ready (runs in a thread-pool executor)."""
+		with self.camObject.condition:
+			return self.camObject.condition.wait(STREAM_MAX_WAIT_TIME_SEC)
+
+	async def _broadcaster(self):
+		"""Encode and broadcast frames to all connected clients until stopped."""
+		loop = asyncio.get_running_loop()
+		while self.camObject.keepStreaming:
+			success = await loop.run_in_executor(None, self._wait_for_frame)
+
+			if not self.camObject.keepStreaming:
+				break
+
+			if not success or not self.clients:
+				continue
+
+			# Per-frame IP re-check: close any newly-blocked clients
+			for ws in list(self.clients):
+				if self._is_blocked(ws.remote_address[0]):
+					self.clients.discard(ws)
+					asyncio.create_task(ws.close(1008, 'Access denied'))
+
+			if not self.clients:
+				continue
+
+			frame_array = np.frombuffer(
+				self.camObject.getFrameCopy(), dtype=np.uint8
+			).reshape(self.camObject.res_rows, self.camObject.res_cols, 3)
+			self.camObject.decorateFrame(frame_array)
+			_, jpeg = cv2.imencode('.jpg', frame_array)
+
+			websockets.broadcast(self.clients, jpeg.tobytes())
+			self.camObject.calcFramerate(self.camObject.fps['stream'], 'stream')
+
+	async def serve(self, port, ssl_context):
+		"""Start the WebSocket server and run the broadcaster until stopped.
+
+		Args:
+			port (int): TCP port to listen on.
+			ssl_context (ssl.SSLContext): TLS context for wss:// connections.
+		"""
+		async with websockets.serve(self._handler, '', port, ssl=ssl_context):
+			await self._broadcaster()
+
+
 class Camera():
 	"""Base class for all camera implementations in the UB camera framework.
 
@@ -3132,11 +3233,32 @@ class Camera():
 	def _thread_stream_websocket(self, portNumber):
 		'''
 		THIS IS A THREAD
-		Placeholder — implemented in Step 2.
+		It starts/runs the WebSocket streaming server.
 		'''
-		self.logger.log('WebSocket streaming not yet implemented.', severity=ub_utils.SEVERITY_WARNING)
-		self.keepStreaming   = False
-		self.activeProtocol = None
+		if not _HAS_WEBSOCKETS:
+			self.logger.log(
+				"WebSocket streaming requires 'websockets'. "
+				"Install with: pip install ub-code[websocket]",
+				severity=ub_utils.SEVERITY_ERROR)
+			self.keepStreaming   = False
+			self.activeProtocol = None
+			return
+
+		try:
+			try:
+				ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+				ssl_context.load_cert_chain(
+					keyfile  = f'{self.sslPath}/ca.key',
+					certfile = f'{self.sslPath}/ca.crt')
+
+				ws_server = WebSocketStreamingServer(self)
+				asyncio.run(ws_server.serve(portNumber, ssl_context))
+
+			finally:
+				self.logger.log('stopping _thread_stream_websocket thread', severity=ub_utils.SEVERITY_INFO)
+
+		except Exception as e:
+			self.logger.log(f'_thread_stream_websocket error: {e}.', severity=ub_utils.SEVERITY_ERROR)
 
 	def _thread_stream_webrtc(self, portNumber, signalingMode):
 		'''
