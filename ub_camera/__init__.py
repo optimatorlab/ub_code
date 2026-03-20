@@ -3905,7 +3905,7 @@ class CameraPi(Camera):
 			# raise Exception(f'Error in camera shutdown: {e}')
 			self.logger.log(f'Error in camera shutdown: {e}', severity=ub_utils.SEVERITY_ERROR)
 					 
-	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, startStream=False, port=None, imgTopic=None, compImgTopic=None):
+	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, startStream=False, port=None, protocol='mjpeg', imgTopic=None, compImgTopic=None):
 		"""Initialize and start Raspberry Pi camera recording.
 
 		This method creates a picamera.PiCamera instance, configures resolution and framerate,
@@ -3917,8 +3917,10 @@ class CameraPi(Camera):
 			res_rows (int, optional): Image height in pixels. If None, uses value from paramDict.
 			res_cols (int, optional): Image width in pixels. If None, uses value from paramDict.
 			framerate (int, optional): Target framerate in fps. If None, uses value from paramDict.
-			startStream (bool, optional): Whether to start HTTP streaming. Defaults to False.
+			startStream (bool, optional): Whether to start streaming. Defaults to False.
 			port (int, optional): Port number for streaming server. Required if startStream=True.
+			protocol (str, optional): Streaming protocol — 'mjpeg' (default), 'websocket',
+				or 'webrtc'. Only used when startStream=True.
 			imgTopic (str, optional): ROS topic name for publishing raw images.
 			compImgTopic (str, optional): ROS topic name for publishing compressed images.
 
@@ -3931,7 +3933,7 @@ class CameraPi(Camera):
 			- Camera records continuously in BGR format for OpenCV compatibility.
 			- Actual resolution/framerate may differ from requested; check self.res_rows,
 			  self.res_cols, and self.fps_target after start.
-			- Stream uses HTTPS with SSL certificates from self.sslPath.
+			- Stream uses HTTPS/WSS with SSL certificates from self.sslPath.
 		"""
 		try:
 			# If user didn't provide a parameter, use the default value
@@ -3958,9 +3960,9 @@ class CameraPi(Camera):
 			if (startStream):
 				if (port is None):
 					raise Exception('cannot stream when port is None')
-				else:	
-					self.startStream(port)
-			
+				else:
+					self.startStream(port, protocol=protocol)
+
 			# Start publishing to ROS compressed image topic?
 			if ((imgTopic is not None) or (compImgTopic is not None)):
 				self.startROStopic(imgTopic=imgTopic, compImgTopic=compImgTopic)	
@@ -4240,17 +4242,19 @@ class CameraROS(Camera):
 		time.sleep(STREAM_MAX_WAIT_TIME_SEC + 1)
 			
 			
-	def start(self, assetID=None, startStream=False, port=None, **kwargs):
+	def start(self, assetID=None, startStream=False, port=None, protocol='mjpeg', **kwargs):
 		"""Start subscribing to ROS CompressedImage topic.
 
 		Creates a ROS subscriber to the configured topic and begins receiving camera frames.
 		Frames arrive via the callback_CompressedImage() callback method. Optionally starts
-		HTTP streaming server to re-broadcast frames.
+		a streaming server to re-broadcast frames.
 
 		Args:
 			assetID (str, optional): Asset identifier to format into topic string (replaces {}).
-			startStream (bool, optional): Whether to start HTTP streaming. Defaults to False.
+			startStream (bool, optional): Whether to start streaming. Defaults to False.
 			port (int, optional): Port number for streaming server. Required if startStream=True.
+			protocol (str, optional): Streaming protocol — 'mjpeg' (default), 'websocket',
+				or 'webrtc'. Only used when startStream=True.
 			**kwargs: Additional keyword arguments (ignored).
 
 		Raises:
@@ -4262,7 +4266,7 @@ class CameraROS(Camera):
 			- If self.topic contains {} placeholder, it's replaced with assetID.
 			- Frames are received asynchronously via callback.
 			- Does not publish to ROS topics (already reading from one).
-			- Stream uses HTTPS with SSL certificates from self.sslPath.
+			- Stream uses HTTPS/WSS with SSL certificates from self.sslPath.
 		"""
 		try:			
 			# If user didn't provide a parameter, use the default value
@@ -4284,8 +4288,8 @@ class CameraROS(Camera):
 			if (startStream):
 				if (port is None):
 					raise Exception('cannot stream when port is None')
-				else:	
-					self.startStream(port)
+				else:
+					self.startStream(port, protocol=protocol)
 			# NOTE: No need to publish to compressed image topic (we're already subscribing to it!)
 
 			self.reachback_pubCamStatus()
@@ -4525,11 +4529,11 @@ class CameraUSB(Camera):
 				self.logger.log(f'Ugh - Extra exception in _thread_capture: {e}', severity=ub_utils.SEVERITY_ERROR)
 				
 			
-	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, device=None, apiPref=None, startStream=False, port=None, imgTopic=None, compImgTopic=None):
+	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, device=None, apiPref=None, startStream=False, port=None, protocol='mjpeg', imgTopic=None, compImgTopic=None):
 		"""Start camera capture thread and optionally start streaming/publishing.
 
 		Creates and starts a daemon thread running _thread_capture() which opens the video
-		source and continuously grabs frames. Optionally starts HTTP streaming server and/or
+		source and continuously grabs frames. Optionally starts a streaming server and/or
 		ROS topic publishing.
 
 		Args:
@@ -4539,8 +4543,10 @@ class CameraUSB(Camera):
 			framerate (int, optional): Target framerate in fps. If None, uses value from paramDict.
 			device (str, optional): Video source path/URL. If None, uses value from __init__.
 			apiPref (int or None, optional): OpenCV API preference. If None, uses value from __init__.
-			startStream (bool, optional): Whether to start HTTP streaming. Defaults to False.
+			startStream (bool, optional): Whether to start streaming. Defaults to False.
 			port (int, optional): Port number for streaming server. Required if startStream=True.
+			protocol (str, optional): Streaming protocol — 'mjpeg' (default), 'websocket',
+				or 'webrtc'. Only used when startStream=True.
 			imgTopic (str, optional): ROS topic name for publishing raw images.
 			compImgTopic (str, optional): ROS topic name for publishing compressed images.
 
@@ -4552,7 +4558,7 @@ class CameraUSB(Camera):
 			- Sets self.camOn = True to signal capture thread to run.
 			- Capture thread is a daemon thread (exits when main program exits).
 			- For RTSP/HTTP streams, actual resolution/framerate may differ from requested.
-			- Stream uses HTTPS with SSL certificates from self.sslPath.
+			- Stream uses HTTPS/WSS with SSL certificates from self.sslPath.
 			- Frames become available in frameDeque shortly after start() returns.
 		"""
 		try:
@@ -4576,8 +4582,8 @@ class CameraUSB(Camera):
 			if (startStream):
 				if (self.port is None):
 					raise Exception('cannot stream when port is None')
-				else:	
-					self.startStream(self.port)
+				else:
+					self.startStream(self.port, protocol=protocol)
 								
 			# Start publishing to ROS compressed image topic?
 			if ((imgTopic is not None) or (compImgTopic is not None)):
