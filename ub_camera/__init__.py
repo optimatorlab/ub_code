@@ -6,7 +6,10 @@ and ROS camera topics with extensive computer vision capabilities.
 
 Main Features:
     - Multiple camera backends (USB, Raspberry Pi Camera Module, ROS topics)
-    - HTTP/HTTPS video streaming (MJPEG)
+    - Video streaming over HTTPS — three protocol options:
+        * MJPEG  (default, no extra deps)
+        * WebSocket + JPEG  (pip install ub-code[websocket])
+        * WebRTC            (pip install ub-code[webrtc])
     - ROS topic publishing (compressed and raw images)
     - ArUco marker detection and tracking
     - Barcode/QR code detection
@@ -26,7 +29,9 @@ Classes:
 Dependencies:
     - numpy
     - opencv-contrib-python (for ArUco support)
-    - rospy, cv_bridge, sensor_msgs (optional, for ROS support)
+    - websockets>=12.0          (optional, for WebSocket streaming)
+    - aiortc>=1.9.0, aiohttp>=3.9.0  (optional, for WebRTC streaming)
+    - rospy, cv_bridge, sensor_msgs  (optional, for ROS support)
     - ub_utils (custom utility module)
 
 Basic Usage:
@@ -38,9 +43,16 @@ Basic Usage:
     camera = CameraUSB(paramDict={'res_rows': 480, 'res_cols': 640, 'fps_target': 30})
     camera.start()
 
-    # Start HTTP streaming
+    # Start streaming (MJPEG default — backward compatible)
     camera.startStream(port=8000)
     # Visit https://localhost:8000/stream.mjpg
+
+    # WebSocket streaming (lower latency)
+    camera.startStream(port=8001, protocol='websocket')
+
+    # WebRTC streaming (lowest latency, built-in browser viewer)
+    camera.startStream(port=8002, protocol='webrtc')
+    # Visit https://localhost:8002/webrtc
 
     # Add ArUco marker detection
     camera.addAruco('DICT_APRILTAG_36h11', fps_target=20)
@@ -2394,7 +2406,8 @@ class Camera():
 	capture mechanisms while inheriting shared streaming, processing, and publishing capabilities.
 
 	Key Features:
-		- HTTPS video streaming with SSL/TLS support
+		- Video streaming over HTTPS/WSS with SSL/TLS support:
+		  MJPEG (default), WebSocket + JPEG, and WebRTC
 		- ROS topic publishing (raw and compressed image formats)
 		- Computer vision modules: ArUco marker detection, barcode/QR code scanning,
 		  face detection, ROI tracking, camera calibration, Ultralytics YOLO models
