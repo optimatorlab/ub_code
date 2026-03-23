@@ -4132,12 +4132,13 @@ class CameraPi2(Camera):
 
 		Calls capture_array("main") in a loop. The call blocks until picamera2
 		delivers the next frame, providing natural pacing without busy-polling.
-		Frames are captured as RGB888 and converted to BGR for OpenCV compatibility.
+		Despite the "RGB888" format label, picamera2 delivers BGR bytes on tested
+		hardware (OV5647/vc4 pipeline), so no conversion is applied.
 		"""
 		while self._capture_running:
 			try:
 				frame = self.cap.capture_array("main")
-				self.frameDeque.append(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+				self.frameDeque.append(frame)  # picamera2 delivers BGR despite RGB888 format label
 				self.announceCondition()
 				self.calcFramerate(self.fps['capture'], 'capture')
 			except Exception as e:

@@ -33,11 +33,19 @@ except Exception as e:
     cam.shutdown()
     sys.exit(1)
 
+# Grab one raw frame directly from picamera2 for diagnostics (bypasses _captureLoop)
+import numpy as np
+time.sleep(1)  # let capture thread warm up
+raw = cam.cap.capture_array("main")
+print(f"  frame shape: {raw.shape}, dtype: {raw.dtype}")
+print(f"  top-left pixel (should be roughly sky/ceiling): {raw[0,0,:]}")
+print(f"  Interpretation: channel order is [0]={raw[0,0,0]} [1]={raw[0,0,1]} [2]={raw[0,0,2]}")
 print()
 print("Stream running. Open in browser:")
-print("  http://192.168.0.105:8000")
+print("  https://192.168.0.105:8000/stream.mjpg")
 print()
 print("Press Ctrl+C to stop.")
+print("(Point camera at something with a distinct red or blue object to verify colors)")
 
 try:
     while True:
