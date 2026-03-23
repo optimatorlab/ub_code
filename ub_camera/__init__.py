@@ -4030,6 +4030,287 @@ class CameraPi(Camera):
 
 		return		
 
+class CameraPi2(Camera):
+	"""Raspberry Pi camera implementation using the picamera2 package.
+
+	This class provides an interface to Raspberry Pi Camera Module hardware using the
+	picamera2 Python library (the successor to picamera). It supports hardware-accelerated
+	video capture, dynamic resolution/framerate changes at runtime, and hardware zoom via
+	the ScalerCrop control.
+
+	Key Differences from CameraPi:
+		- Uses picamera2 library instead of the legacy picamera library
+		- Frames are delivered via a background pull thread calling capture_array("main")
+		  rather than a push callback (write method)
+		- Zoom is implemented via ScalerCrop control using pixel coordinates queried
+		  at runtime from camera_properties["PixelArraySize"]
+		- Framerate is set via FrameDurationLimits control (microseconds)
+		- Headless operation assumed (no preview window)
+
+	Hardware Support:
+		- Raspberry Pi 3B, 4, 5, CM5
+		- Raspberry Pi Camera Module v2 (IMX219)
+		- Raspberry Pi Camera Module v3 (IMX708)
+		- Raspberry Pi High Quality Camera (IMX477)
+
+	Usage Example:
+		>>> cam = CameraPi2()
+		>>> cam.start(res_rows=720, res_cols=1280, framerate=30, startStream=True, port=8000)
+		>>>
+		>>> cam.changeZoom(2.0)
+		>>> cam.changeResolutionFramerate(res_rows=480, res_cols=640, framerate=15)
+		>>> cam.shutdown()
+
+	Important Notes:
+		- Requires picamera2: installed via apt as python3-picamera2 (tested on v0.3.34)
+		- Only works on Raspberry Pi hardware with camera modules enabled in raspi-config
+		- Headless operation: no preview window is started
+		- Frames are captured as BGR888 for OpenCV compatibility
+
+	Attributes:
+		cap (Picamera2): The Picamera2 instance controlling the hardware.
+		Picamera2 (class): Reference to the imported Picamera2 class.
+		_capture_thread (threading.Thread): Background thread running the frame pull loop.
+		_capture_running (bool): Flag used to signal the capture thread to stop.
+	"""
+	def __init__(self, paramDict={'res_rows':480, 'res_cols':640, 'fps_target':30, 'outputPort': 8000},
+				device='/dev/video0', apiPref=cv2.CAP_V4L2, logger=None, sslPath=None, pubCamStatusFunction=None,
+				imgTopic=None, compImgTopic=None, initROSnode=False, showFPS=True, ipAllowlist=[], ipBlocklist=[]):
+		"""Initialize Raspberry Pi camera interface using picamera2.
+
+		Args:
+			paramDict (dict, optional): Configuration dictionary. Defaults to 480x640 @ 30fps.
+				Supported keys: 'res_rows', 'res_cols', 'fps_target', 'outputPort'.
+			device (str, optional): Device path (not used by picamera2). Defaults to '/dev/video0'.
+			apiPref (int, optional): API preference (not used by picamera2). Defaults to cv2.CAP_V4L2.
+			logger (Logger, optional): Logger instance. If None, creates default logger.
+			sslPath (str, optional): Path to SSL certificates for HTTPS streaming.
+			pubCamStatusFunction (callable, optional): Callback function to publish camera status.
+			imgTopic (str, optional): ROS image topic name for publishing raw images.
+			compImgTopic (str, optional): ROS compressed image topic name.
+			initROSnode (bool, optional): Whether to initialize ROS node. Defaults to False.
+			showFPS (bool, optional): Whether to display FPS information. Defaults to True.
+			ipAllowlist (list, optional): List of allowed IP addresses for streaming.
+			ipBlocklist (list, optional): List of blocked IP addresses for streaming.
+
+		Notes:
+			- The device and apiPref parameters are accepted for API consistency but not used.
+			- picamera2 must be installed (apt install python3-picamera2).
+			- Camera hardware must be enabled in raspi-config.
+		"""
+		try:
+			from picamera2 import Picamera2
+			self.Picamera2 = Picamera2
+		except Exception as e:
+			print(f'Failed to init CameraPi2: {e}')
+
+		super().__init__(paramDict, logger, sslPath, pubCamStatusFunction, initROSnode, showFPS, ipAllowlist, ipBlocklist)
+
+		self.cap = None
+		self._capture_thread = None
+		self._capture_running = False
+
+	def _startCaptureThread(self):
+		"""Start the background frame capture thread."""
+		self._capture_running = True
+		self._capture_thread = threading.Thread(target=self._captureLoop, daemon=True)
+		self._capture_thread.start()
+
+	def _stopCaptureThread(self, timeout=3.0):
+		"""Signal the capture thread to stop and wait for it to finish.
+
+		Args:
+			timeout (float): Seconds to wait for the thread to join. Defaults to 3.0.
+		"""
+		self._capture_running = False
+		if self._capture_thread is not None:
+			self._capture_thread.join(timeout=timeout)
+			self._capture_thread = None
+
+	def _captureLoop(self):
+		"""Background thread: pull frames from picamera2 and populate frameDeque.
+
+		Calls capture_array("main") in a loop. The call blocks until picamera2
+		delivers the next frame, providing natural pacing without busy-polling.
+		Frames are already in BGR format (configured as BGR888 at start).
+		"""
+		while self._capture_running:
+			try:
+				frame = self.cap.capture_array("main")
+				self.frameDeque.append(frame)
+				self.announceCondition()
+				self.calcFramerate(self.fps['capture'], 'capture')
+			except Exception as e:
+				self.logger.log(f'Error in CameraPi2 capture loop: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def _changeFramerate(self, req_framerate):
+		try:
+			if req_framerate == self.fps_target:
+				return (True, '')
+
+			if self.fpsMin <= req_framerate <= self.fpsMax:
+				frame_duration_us = int(1e6 / req_framerate)
+				self.cap.set_controls({"FrameDurationLimits": (frame_duration_us, frame_duration_us)})
+				self.updateFramerate(req_framerate)
+				return (True, '')
+			else:
+				return (False, 'picam2 framerate is at limit')
+
+		except Exception as e:
+			return (False, f'Could not change picam2 framerate: {e}')
+
+	def _changeResolution(self, req_height, req_width):
+		try:
+			current_size = self.cap.camera_configuration()["main"]["size"]  # (width, height)
+			if current_size == (req_width, req_height):
+				return (False, f'picam2 resolution is already {req_width}x{req_height}.')
+
+			self._stopCaptureThread()
+			self.cap.stop()
+
+			config = self.cap.create_video_configuration(
+				main={"format": "BGR888", "size": (req_width, req_height)}
+			)
+			self.cap.configure(config)
+			self.cap.start()
+
+			frame_duration_us = int(1e6 / self.fps_target)
+			self.cap.set_controls({"FrameDurationLimits": (frame_duration_us, frame_duration_us)})
+
+			self.updateResolution(req_height, req_width)
+			self._startCaptureThread()
+			return (True, '')
+
+		except Exception as e:
+			return (False, f'Could not change picam2 resolution to {req_width}x{req_height}: {e}.')
+
+	def changeZoom(self, zoomLevel):
+		"""Change camera zoom level using hardware ScalerCrop control.
+
+		Queries the sensor's full pixel array size at runtime and computes a
+		center-crop rectangle corresponding to the requested zoom level. Works
+		across all supported camera modules (IMX219, IMX708, IMX477).
+
+		Args:
+			zoomLevel (float): Zoom level where 1.0 = no zoom, 2.0 = 2x zoom, etc.
+
+		Notes:
+			- Zoom is centered on the frame.
+			- Output resolution remains constant regardless of zoom level.
+			- Maximum zoom is limited by sensor resolution and hardware.
+
+		References:
+			https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf
+		"""
+		try:
+			sensor_w, sensor_h = self.cap.camera_properties["PixelArraySize"]
+			crop_w = int(sensor_w / zoomLevel)
+			crop_h = int(sensor_h / zoomLevel)
+			crop_x = (sensor_w - crop_w) // 2
+			crop_y = (sensor_h - crop_h) // 2
+			self.cap.set_controls({"ScalerCrop": (crop_x, crop_y, crop_w, crop_h)})
+			self.updateZoom(zoomLevel)
+		except Exception as e:
+			self.logger.log(f'Could not change picam2 zoomLevel to {zoomLevel}x: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def changeResolutionFramerate(self, res_rows=None, res_cols=None, framerate=None):
+		"""Change resolution and/or framerate."""
+		try:
+			res_rows  = self.defaultFromNone(res_rows,  self.res_rows,   int)
+			res_cols  = self.defaultFromNone(res_cols,  self.res_cols,   int)
+			framerate = self.defaultFromNone(framerate, self.fps_target, int)
+
+			(successFr,  msgFr)  = self._changeFramerate(framerate)
+			(successRes, msgRes) = self._changeResolution(res_rows, res_cols)
+
+			if ((not successFr) or (not successRes)):
+				raise Exception(f'{msgFr} {msgRes}')
+
+		except Exception as e:
+			self.logger.log(f'Failed to change to {res_rows} rows, {res_cols} cols, {framerate} framerate: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def shutdown(self):
+		"""Shutdown camera and release all resources.
+
+		Stops the capture thread, halts recording, closes the Picamera2 instance,
+		and waits for streaming threads to finish.
+		"""
+		try:
+			if self.cap:
+				self.stop()
+				self.cap.close()
+				time.sleep(STREAM_MAX_WAIT_TIME_SEC + 1)
+		except Exception as e:
+			self.logger.log(f'Error in camera shutdown: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, startStream=False, port=None, protocol='mjpeg', imgTopic=None, compImgTopic=None):
+		"""Initialize and start Raspberry Pi camera using picamera2.
+
+		Creates a Picamera2 instance, configures it for continuous video capture
+		in BGR888 format, starts the hardware, and launches the background capture
+		thread. Optionally starts HTTP streaming and/or ROS topic publishing.
+
+		Args:
+			assetID (str, optional): Asset identifier (not used by CameraPi2).
+			res_rows (int, optional): Image height in pixels. If None, uses value from paramDict.
+			res_cols (int, optional): Image width in pixels. If None, uses value from paramDict.
+			framerate (int, optional): Target framerate in fps. If None, uses value from paramDict.
+			startStream (bool, optional): Whether to start streaming. Defaults to False.
+			port (int, optional): Port number for streaming server. Required if startStream=True.
+			protocol (str, optional): Streaming protocol — 'mjpeg' (default), 'websocket', or 'webrtc'.
+			imgTopic (str, optional): ROS topic name for publishing raw images.
+			compImgTopic (str, optional): ROS topic name for publishing compressed images.
+		"""
+		try:
+			res_rows  = self.defaultFromNone(res_rows,  self.res_rows,   int)
+			res_cols  = self.defaultFromNone(res_cols,  self.res_cols,   int)
+			framerate = self.defaultFromNone(framerate, self.fps_target, int)
+			port      = self.defaultFromNone(port, self.outputPort)
+
+			self.cap = self.Picamera2()
+
+			config = self.cap.create_video_configuration(
+				main={"format": "BGR888", "size": (res_cols, res_rows)}
+			)
+			self.cap.configure(config)
+			self.cap.start()
+
+			frame_duration_us = int(1e6 / framerate)
+			self.cap.set_controls({"FrameDurationLimits": (frame_duration_us, frame_duration_us)})
+
+			# Read back actual configured size
+			actual_size = self.cap.camera_configuration()["main"]["size"]
+			self.updateResolution(actual_size[1], actual_size[0])
+			self.updateFramerate(framerate)  # picamera2 doesn't expose set framerate directly
+
+			self.camOn = True
+			self._startCaptureThread()
+
+			if startStream:
+				if port is None:
+					raise Exception('cannot stream when port is None')
+				else:
+					self.startStream(port, protocol=protocol)
+
+			if (imgTopic is not None) or (compImgTopic is not None):
+				self.startROStopic(imgTopic=imgTopic, compImgTopic=compImgTopic)
+
+			self.reachback_pubCamStatus()
+
+		except Exception as e:
+			self.logger.log(f'Error in camera start: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def stop(self):
+		"""Stop camera capture and streaming."""
+		try:
+			self.camOn = False
+			self._stopCaptureThread()
+			self.cap.stop()
+			self.stopStream()
+		except Exception as e:
+			raise Exception(f'Error in camera stop: {e}')
+
+
 class CameraROS(Camera):
 	"""ROS camera subscriber/publisher implementation for compressed image topics.
 
