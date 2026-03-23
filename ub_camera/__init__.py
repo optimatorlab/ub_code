@@ -4132,12 +4132,12 @@ class CameraPi2(Camera):
 
 		Calls capture_array("main") in a loop. The call blocks until picamera2
 		delivers the next frame, providing natural pacing without busy-polling.
-		Frames are already in BGR format (configured as BGR888 at start).
+		Frames are captured as RGB888 and converted to BGR for OpenCV compatibility.
 		"""
 		while self._capture_running:
 			try:
 				frame = self.cap.capture_array("main")
-				self.frameDeque.append(frame)
+				self.frameDeque.append(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
 				self.announceCondition()
 				self.calcFramerate(self.fps['capture'], 'capture')
 			except Exception as e:
@@ -4169,7 +4169,7 @@ class CameraPi2(Camera):
 			self.cap.stop()
 
 			config = self.cap.create_video_configuration(
-				main={"format": "BGR888", "size": (req_width, req_height)}
+				main={"format": "RGB888", "size": (req_width, req_height)}
 			)
 			self.cap.configure(config)
 			self.cap.start()
@@ -4270,7 +4270,7 @@ class CameraPi2(Camera):
 			self.cap = self.Picamera2()
 
 			config = self.cap.create_video_configuration(
-				main={"format": "BGR888", "size": (res_cols, res_rows)}
+				main={"format": "RGB888", "size": (res_cols, res_rows)}
 			)
 			self.cap.configure(config)
 			self.cap.start()
