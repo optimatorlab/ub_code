@@ -4601,10 +4601,11 @@ class CameraUSB(Camera):
 	Key Differences from Base Camera:
 		- Uses cv2.VideoCapture for frame acquisition
 		- Supports multiple video backends via apiPref parameter (V4L2, FFMPEG, etc.)
-		- Threaded capture via _thread_capture() for continuous frame grabbing
+		- VideoCapture opened synchronously in start(); frame loop runs in _captureLoop()
 		- Digital zoom only (crops and resizes frames in software)
 		- Supports dynamic resolution/framerate changes by restarting capture
 		- Can connect to RTSP/HTTP streams (not just local devices)
+		- Optional frameProcessor hook for per-frame CV processing
 
 	Supported Sources:
 		- USB webcams (e.g., /dev/video0 with V4L2 backend)
@@ -4635,6 +4636,20 @@ class CameraUSB(Camera):
 		>>>
 		>>> # Stop camera
 		>>> cam.shutdown()
+		>>>
+		>>> # Per-frame CV processing via frameProcessor hook:
+		>>> #   - Return a frame  → appended to frameDeque and streamed.
+		>>> #   - Return None     → frame discarded (not streamed, not published to ROS).
+		>>> #   - frameProcessor = None (default) → pass-through, unchanged behavior.
+		>>> # The hook fires after zoomFunction, so the frame is always correctly zoomed.
+		>>> cam = CameraUSB(device='/dev/video0')
+		>>> def my_pipeline(frame):
+		...     frame = apply_color_filter(frame)
+		...     frame = cv2.GaussianBlur(frame, (5, 5), 0)
+		...     return frame        # return edited frame -> it streams
+		...     # return None       # return None -> frame is dropped (not streamed)
+		>>> cam.frameProcessor = my_pipeline
+		>>> cam.start(startStream=True, port=8000)
 
 	Important Notes:
 		- For RTSP/HTTP streams, set apiPref=None to let OpenCV choose backend
@@ -4649,7 +4664,12 @@ class CameraUSB(Camera):
 		device (str): Video source path or URL (e.g., '/dev/video0' or 'rtsp://...').
 		apiPref (int or None): OpenCV VideoCapture API preference (e.g., cv2.CAP_V4L2).
 		fourcc (tuple or None): FOURCC codec as 4-char tuple (e.g., ('M','J','P','G')).
-		cap (cv2.VideoCapture): OpenCV VideoCapture instance.
+		cap (cv2.VideoCapture): OpenCV VideoCapture instance (None when stopped).
+		_capture_thread (threading.Thread): Background thread running the frame pull loop.
+		_capture_running (bool): Flag used to signal the capture thread to stop.
+		frameProcessor (callable or None): Optional per-frame hook. Called as
+			frameProcessor(frame) after zoomFunction. Return a frame to stream it,
+			or return None to drop the frame (not streamed, not published to ROS).
 	"""
 	
 	def __init__(self, paramDict={'res_rows':480, 'res_cols':640, 'fps_target':30, 'outputPort': 8000}, device='/dev/video0',
@@ -4702,120 +4722,70 @@ class CameraUSB(Camera):
 			self.fourcc  = fourcc   
 
 		self.apiPref = apiPref
-		
-		self.cap = None
-				
-				
-	def _thread_capture(self, res_rows, res_cols, framerate, fourcc, device, apiPref):
-		"""Threaded capture loop for continuously grabbing frames from video source.
 
-		This thread creates a cv2.VideoCapture instance, configures it with the specified
-		parameters, and continuously reads frames in a loop. Frames are added to the
-		frame deque for access by other parts of the application. The thread runs until
-		self.camOn is set to False.
+		self.cap = None
+		self._capture_thread  = None
+		self._capture_running = False
+		self.frameProcessor   = None   # optional callable(frame) -> frame | None
+				
+				
+	def _startCaptureThread(self):
+		"""Start the background frame capture thread."""
+		self._capture_running = True
+		self._capture_thread = threading.Thread(target=self._captureLoop, daemon=True)
+		self._capture_thread.start()
+
+	def _stopCaptureThread(self, timeout=3.0):
+		"""Signal the capture thread to stop and wait for it to finish.
 
 		Args:
-			res_rows (int): Requested image height in pixels.
-			res_cols (int): Requested image width in pixels.
-			framerate (int): Requested framerate in fps.
-			fourcc (tuple or None): FOURCC codec as 4-char tuple (e.g., ('M','J','P','G')).
-			device (str): Video source path or URL.
-			apiPref (int or None): OpenCV VideoCapture API preference.
-
-		Notes:
-			- This is a thread method, not meant to be called directly.
-			- Started automatically by start() method.
-			- For RTSP/HTTP streams (apiPref=None), resolution/framerate may be ignored.
-			- For USB cameras (apiPref=cv2.CAP_V4L2), attempts to set resolution/framerate/codec.
-			- Actual resolution/framerate stored in self.res_rows, self.res_cols, self.fps_target.
-			- Continuously grabs frames via cap.read() until self.camOn becomes False.
-			- Each frame has digital zoom applied if zoom level > 1.0.
-			- Frames are appended to self.frameDeque with condition notification.
-			- Automatically releases VideoCapture when loop exits.
+			timeout (float): Seconds to wait for the thread to join. Defaults to 3.0.
 		"""
-		try:	
-			# See https://www.simonwenkel.com/notes/software_libraries/opencv/opencv-frame-io.html 						
-			'''
-			self.cap = cv2.VideoCapture(device, apiPref, 
-									(cv2.CAP_PROP_FPS,          int(framerate), 
-									 cv2.CAP_PROP_FRAME_WIDTH,  int(res_cols),
-									 cv2.CAP_PROP_FRAME_HEIGHT, int(res_rows))) 
-			'''
+		self._capture_running = False
+		if self._capture_thread is not None:
+			self._capture_thread.join(timeout=timeout)
+			self._capture_thread = None
 
-			# Update 2024-02-26.  VOXL cameras use rtsp feeds, which prefer different API and don't use v4l2.
-			# So, for VOXLs, set `apiPref = None`
-			# FIXME -- Might consider using `apiPref = cv2.CAP_FFMPEG`
-			if (apiPref is None):
-				self.cap = cv2.VideoCapture(device)
-			else:
-				params = [cv2.CAP_PROP_FRAME_WIDTH,  int(res_cols), 
-						  cv2.CAP_PROP_FRAME_HEIGHT, int(res_rows), 
-						  cv2.CAP_PROP_FPS,          int(framerate)]
-				if (fourcc is not None):
-					fourcc = cv2.VideoWriter.fourcc(fourcc[0], fourcc[1], fourcc[2], fourcc[3])
-					params.extend([cv2.CAP_PROP_FOURCC, fourcc])
-					
-				self.cap = cv2.VideoCapture(device, apiPref, params=params)
-				'''
-				self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, res_rows)
-				self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  res_cols)
-				self.cap.set(cv2.CAP_PROP_FPS, framerate)
-				self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'))
-				'''
-				
-				# cv2.CAP_PROP_ZOOM, 50.0 does not work on Dell laptop camera
+	def _captureLoop(self):
+		"""Background thread: pull frames from cv2.VideoCapture and populate frameDeque.
 
-				'''
-				See https://www.simonwenkel.com/notes/software_libraries/opencv/opencv-frame-io.html
-				self.cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L)
-				self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, res_rows)
-				self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  res_cols)
-				self.cap.set(cv2.CAP_PROP_FPS, framerate)
-				codec = cv2.VideoWriter.fourcc('M','J', 'P','G')
-				self.cap.set(cv2.CAP_PROP_FOURCC, codec)
-				'''
-
-			# FIXME -- Need to verify that the updates actually went thru
-			self.updateResolution(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT), self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) 
-			self.updateFramerate(self.cap.get(cv2.CAP_PROP_FPS))
-			
-			# self.logger.log(f'_thread_capture: {res_rows}, {res_cols}, {framerate}', severity=ub_utils.SEVERITY_DEBUG)
-
-		except Exception as e:
-			# raise Exception(f'CameraUSB capture thread Failed: {e}')
-			self.logger.log(f'CameraUSB capture thread Failed: {e}', severity=ub_utils.SEVERITY_ERROR)
-			
-		else:	
+		Runs until _capture_running is False or VideoCapture closes unexpectedly.
+		Applies zoomFunction to each frame, then passes the result to frameProcessor
+		(if set). If frameProcessor returns None the frame is dropped — it is not
+		appended to frameDeque and therefore not streamed or published to ROS.
+		"""
+		while self._capture_running:
 			try:
-				print(f'Camera Opened? {self.cap.isOpened()}')
-				while(self.cap.isOpened()):
-					ret, frame = self.cap.read()
-					
-					if (ret):
-						# Are we zooming?
-						frame = self.zoomFunction(frame)
+				if not self.cap.isOpened():
+					self.logger.log('CameraUSB: VideoCapture closed unexpectedly', severity=ub_utils.SEVERITY_ERROR)
+					break
 
-						self.frameDeque.append(frame)					
+				ret, frame = self.cap.read()
+				if not ret:
+					continue
 
-						self.announceCondition()
-						
-						self.calcFramerate(self.fps['capture'], 'capture')
-										
-					if (not self.camOn):
-						self.cap.release()
-						break
+				frame = self.zoomFunction(frame)
 
-				# If we make it here, unset our flag:
-				self.camOn = False
+				if self.frameProcessor is not None:
+					frame = self.frameProcessor(frame)
+					if frame is None:
+						continue   # user chose to drop this frame
+
+				self.frameDeque.append(frame)
+				self.announceCondition()
+				self.calcFramerate(self.fps['capture'], 'capture')
+
 			except Exception as e:
-				self.logger.log(f'Ugh - Extra exception in _thread_capture: {e}', severity=ub_utils.SEVERITY_ERROR)
+				self.logger.log(f'Error in CameraUSB capture loop: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+		self.camOn = False
 				
 			
 	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, device=None, apiPref=None, startStream=False, port=None, protocol='mjpeg', imgTopic=None, compImgTopic=None):
-		"""Start camera capture thread and optionally start streaming/publishing.
+		"""Start camera capture and optionally start streaming/publishing.
 
-		Creates and starts a daemon thread running _thread_capture() which opens the video
-		source and continuously grabs frames. Optionally starts a streaming server and/or
+		Opens and configures cv2.VideoCapture synchronously, then launches the
+		background capture thread. Optionally starts a streaming server and/or
 		ROS topic publishing.
 
 		Args:
@@ -4833,58 +4803,79 @@ class CameraUSB(Camera):
 			compImgTopic (str, optional): ROS topic name for publishing compressed images.
 
 		Raises:
+			Exception: If VideoCapture fails to open.
 			Exception: If startStream=True but port=None.
-			Exception: If camera cannot be opened or configured.
 
 		Notes:
-			- Sets self.camOn = True to signal capture thread to run.
-			- Capture thread is a daemon thread (exits when main program exits).
+			- VideoCapture is opened synchronously; failures are logged immediately.
 			- For RTSP/HTTP streams, actual resolution/framerate may differ from requested.
 			- Stream uses HTTPS/WSS with SSL certificates from self.sslPath.
 			- Frames become available in frameDeque shortly after start() returns.
 		"""
 		try:
-			self.camOn = True
-			
 			# If user didn't provide a parameter, use the default value
-			self.res_rows     = self.defaultFromNone(res_rows, self.res_rows, int)
-			self.res_cols     = self.defaultFromNone(res_cols, self.res_cols, int)
-			self.framerate    = self.defaultFromNone(framerate, self.fps_target, int)
-			self.device       = self.defaultFromNone(device, self.device)
-			self.apiPref      = self.defaultFromNone(apiPref, self.apiPref)
-			self.port         = self.defaultFromNone(port, self.outputPort)
-			# compImgTopic =
+			self.res_rows  = self.defaultFromNone(res_rows,  self.res_rows,  int)
+			self.res_cols  = self.defaultFromNone(res_cols,  self.res_cols,  int)
+			self.framerate = self.defaultFromNone(framerate, self.fps_target, int)
+			self.device    = self.defaultFromNone(device,    self.device)
+			self.apiPref   = self.defaultFromNone(apiPref,   self.apiPref)
+			self.port      = self.defaultFromNone(port,      self.outputPort)
 
-			# Start capturing
-			capThread = threading.Thread(target=self._thread_capture, args=(self.res_rows, self.res_cols, self.framerate, self.fourcc, self.device, self.apiPref,))
-			capThread.daemon = True
-			capThread.start()
+			# Open and configure VideoCapture synchronously.
+			# VOXL cameras use RTSP feeds that prefer the default backend, so
+			# apiPref=None skips the V4L2/DSHOW path entirely.
+			# See https://www.simonwenkel.com/notes/software_libraries/opencv/opencv-frame-io.html
+			if self.apiPref is None:
+				self.cap = cv2.VideoCapture(self.device)
+			else:
+				params = [cv2.CAP_PROP_FRAME_WIDTH,  int(self.res_cols),
+						  cv2.CAP_PROP_FRAME_HEIGHT, int(self.res_rows),
+						  cv2.CAP_PROP_FPS,          int(self.framerate)]
+				if self.fourcc is not None:
+					fourcc_code = cv2.VideoWriter.fourcc(self.fourcc[0], self.fourcc[1], self.fourcc[2], self.fourcc[3])
+					params.extend([cv2.CAP_PROP_FOURCC, fourcc_code])
+				self.cap = cv2.VideoCapture(self.device, self.apiPref, params=params)
+
+			if not self.cap.isOpened():
+				raise Exception(f'cv2.VideoCapture failed to open: {self.device}')
+
+			# Read back what the driver actually configured
+			# FIXME -- Need to verify that the updates actually went thru
+			self.updateResolution(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT), self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+			self.updateFramerate(self.cap.get(cv2.CAP_PROP_FPS))
+
+			self.camOn = True
+			self._startCaptureThread()
 
 			# Start streaming?
-			if (startStream):
-				if (self.port is None):
+			if startStream:
+				if self.port is None:
 					raise Exception('cannot stream when port is None')
-				else:
-					self.startStream(self.port, protocol=protocol)
-								
-			# Start publishing to ROS compressed image topic?
-			if ((imgTopic is not None) or (compImgTopic is not None)):
-				self.startROStopic(imgTopic=imgTopic, compImgTopic=compImgTopic)	
+				self.startStream(self.port, protocol=protocol)
 
+			# Start publishing to ROS compressed image topic?
+			if (imgTopic is not None) or (compImgTopic is not None):
+				self.startROStopic(imgTopic=imgTopic, compImgTopic=compImgTopic)
 
 			self.reachback_pubCamStatus()
 		except Exception as e:
 			self.logger.log(f'Error in camera start: {e}', severity=ub_utils.SEVERITY_ERROR)
 	
 	def stop(self, stopStream=True):
-		'''
-		Stop capture thread
-		Stop capturing numpy array?
-		'''
-		self.camOn = False	
-		
-		# We may choose not to stop the stream if we are changing resolution/framerate.	
-		if (stopStream):
+		"""Stop the capture thread and release VideoCapture.
+
+		Args:
+			stopStream (bool): Whether to also stop the streaming server.
+				Set False when changing resolution/framerate mid-stream.
+		"""
+		self.camOn = False
+		self._stopCaptureThread()
+		if self.cap is not None:
+			self.cap.release()
+			self.cap = None
+
+		# We may choose not to stop the stream if we are changing resolution/framerate.
+		if stopStream:
 			self.stopStream()
 		
 	def shutdown(self):
@@ -4924,30 +4915,28 @@ class CameraUSB(Camera):
 			res_rows  = self.defaultFromNone(res_rows,  self.res_rows,   int)
 			res_cols  = self.defaultFromNone(res_cols,  self.res_cols,   int)
 			framerate = self.defaultFromNone(framerate, self.fps_target, int)
-			
-			if (hasattr(self, 'fpsMin') and hasattr(self, 'fpsMax')):
-				if ((framerate < self.fpsMin) or (framerate > self.fpsMax)):
-					raise Exception(f'framerate {framerate} ouside of [{self.fpsMin},{self.fpsMin}] bounds.')
-				
-			if ((framerate != self.cap.get(cv2.CAP_PROP_FPS)) or 
-				(res_rows  != self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 
-				(res_cols  != self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))):
-				
+
+			if hasattr(self, 'fpsMin') and hasattr(self, 'fpsMax'):
+				if not (self.fpsMin <= framerate <= self.fpsMax):
+					raise Exception(f'framerate {framerate} outside of [{self.fpsMin},{self.fpsMax}] bounds.')
+
+			# Compare against stored attributes (cap may be None after stop())
+			if (framerate != self.fps_target or
+					res_rows != self.res_rows or
+					res_cols != self.res_cols):
+
 				# Need to stop/release camera to make updates.
-				# However, don't stop the stream (if it is running)
+				# However, don't stop the stream (if it is running).
 				self.stop(stopStream=False)
 				time.sleep(1)
 
-				# Now, we'll re-start the thread, re-initializing camera with new params:
+				# Re-start, re-opening VideoCapture with new params.
+				# start() reads back actuals from the driver and calls updateResolution/updateFramerate.
 				self.start(res_rows=res_rows, res_cols=res_cols, framerate=framerate)
-			
-			# FIXME -- Need to verify that the updates actually went thru
-			self.updateResolution(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT), self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) 
-			self.updateFramerate(self.cap.get(cv2.CAP_PROP_FPS))
 
 			fourccText = self.fourcc2text()
 			self.logger.log(f'rows: {self.res_rows}, cols: {self.res_cols}, framerate: {framerate}', severity=ub_utils.SEVERITY_DEBUG)
-			
+
 		except Exception as e:
 			self.logger.log(f'Failed to change to {res_rows} rows, {res_cols} cols, {framerate} framerate: {e}', severity=ub_utils.SEVERITY_ERROR)
 
