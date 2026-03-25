@@ -4060,6 +4060,43 @@ class CameraPi2(Camera):
 		>>> cam.changeZoom(2.0)
 		>>> cam.changeResolutionFramerate(res_rows=480, res_cols=640, framerate=15)
 		>>> cam.shutdown()
+		>>>
+		>>> # Per-frame CV processing via frameProcessor hook:
+		>>> #   - Return a frame  → appended to frameDeque and streamed.
+		>>> #   - Return None     → frame discarded (not streamed, not published to ROS).
+		>>> #   - frameProcessor = None (default) → pass-through, unchanged behavior.
+		>>>
+		>>> # Process and stream the edited frame:
+		>>> cam = CameraPi2()
+		>>> def my_pipeline(frame):
+		...     frame = apply_color_filter(frame)
+		...     frame = cv2.GaussianBlur(frame, (5, 5), 0)
+		...     return frame        # return edited frame -> it streams
+		...     # return None       # return None -> frame is dropped (not streamed)
+		>>> cam.frameProcessor = my_pipeline
+		>>> cam.start(startStream=True, port=8000)
+		>>>
+		>>> # Process a copy, stream the original unchanged:
+		>>> def my_pipeline(frame):
+		...     processed = frame.copy()
+		...     processed = apply_color_filter(processed)
+		...     do_something_with(processed)
+		...     return frame        # original streams unchanged
+		>>>
+		>>> # Non-blocking processing via worker thread (e.g. for slow inference):
+		>>> # maxsize=1 ensures the worker always sees the latest frame and memory stays bounded.
+		>>> import queue, threading
+		>>> q = queue.Queue(maxsize=1)
+		>>> def worker():
+		...     while True:
+		...         frame = q.get()
+		...         if frame is None: break
+		...         do_something_with(run_inference(frame))
+		>>> threading.Thread(target=worker, daemon=True).start()
+		>>> def my_pipeline(frame):
+		...     try: q.put_nowait(frame.copy())  # drop frame if worker is still busy
+		...     except queue.Full: pass
+		...     return frame        # original always streams without blocking
 
 	Important Notes:
 		- Requires picamera2: installed via apt as python3-picamera2 (tested on v0.3.34)
@@ -4072,6 +4109,9 @@ class CameraPi2(Camera):
 		Picamera2 (class): Reference to the imported Picamera2 class.
 		_capture_thread (threading.Thread): Background thread running the frame pull loop.
 		_capture_running (bool): Flag used to signal the capture thread to stop.
+		frameProcessor (callable or None): Optional per-frame hook. Called as
+			frameProcessor(frame) on each captured frame. Return a frame to stream it,
+			or return None to drop the frame (not streamed, not published to ROS).
 	"""
 	def __init__(self, paramDict={'res_rows':480, 'res_cols':640, 'fps_target':30, 'outputPort': 8000},
 				device='/dev/video0', apiPref=cv2.CAP_V4L2, logger=None, sslPath=None, pubCamStatusFunction=None,
@@ -4109,6 +4149,7 @@ class CameraPi2(Camera):
 		self.cap = None
 		self._capture_thread = None
 		self._capture_running = False
+		self.frameProcessor = None   # optional callable(frame) -> frame | None
 
 	def _startCaptureThread(self):
 		"""Start the background frame capture thread."""
@@ -4134,11 +4175,20 @@ class CameraPi2(Camera):
 		delivers the next frame, providing natural pacing without busy-polling.
 		Despite the "RGB888" format label, picamera2 delivers BGR bytes on tested
 		hardware (OV5647/vc4 pipeline), so no conversion is applied.
+
+		If frameProcessor is set, it is called on each frame. Return a frame to
+		stream it, or return None to drop the frame (not streamed, not published to ROS).
 		"""
 		while self._capture_running:
 			try:
-				frame = self.cap.capture_array("main")
-				self.frameDeque.append(frame)  # picamera2 delivers BGR despite RGB888 format label
+				frame = self.cap.capture_array("main")  # picamera2 delivers BGR despite RGB888 format label
+
+				if self.frameProcessor is not None:
+					frame = self.frameProcessor(frame)
+					if frame is None:
+						continue   # user chose to drop this frame
+
+				self.frameDeque.append(frame)
 				self.announceCondition()
 				self.calcFramerate(self.fps['capture'], 'capture')
 			except Exception as e:
@@ -4642,6 +4692,8 @@ class CameraUSB(Camera):
 		>>> #   - Return None     → frame discarded (not streamed, not published to ROS).
 		>>> #   - frameProcessor = None (default) → pass-through, unchanged behavior.
 		>>> # The hook fires after zoomFunction, so the frame is always correctly zoomed.
+		>>>
+		>>> # Process and stream the edited frame:
 		>>> cam = CameraUSB(device='/dev/video0')
 		>>> def my_pipeline(frame):
 		...     frame = apply_color_filter(frame)
@@ -4650,6 +4702,28 @@ class CameraUSB(Camera):
 		...     # return None       # return None -> frame is dropped (not streamed)
 		>>> cam.frameProcessor = my_pipeline
 		>>> cam.start(startStream=True, port=8000)
+		>>>
+		>>> # Process a copy, stream the original unchanged:
+		>>> def my_pipeline(frame):
+		...     processed = frame.copy()
+		...     processed = apply_color_filter(processed)
+		...     do_something_with(processed)
+		...     return frame        # original streams unchanged
+		>>>
+		>>> # Non-blocking processing via worker thread (e.g. for slow inference):
+		>>> # maxsize=1 ensures the worker always sees the latest frame and memory stays bounded.
+		>>> import queue, threading
+		>>> q = queue.Queue(maxsize=1)
+		>>> def worker():
+		...     while True:
+		...         frame = q.get()
+		...         if frame is None: break
+		...         do_something_with(run_inference(frame))
+		>>> threading.Thread(target=worker, daemon=True).start()
+		>>> def my_pipeline(frame):
+		...     try: q.put_nowait(frame.copy())  # drop frame if worker is still busy
+		...     except queue.Full: pass
+		...     return frame        # original always streams without blocking
 
 	Important Notes:
 		- For RTSP/HTTP streams, set apiPref=None to let OpenCV choose backend

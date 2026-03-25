@@ -510,8 +510,67 @@ print("When you're done, be sure to stop the camera: camera.stop()")
 camera.stopStream()
 camera.stop()
 ```
-    
----  
+
+---
+
+### 5.  Per-frame processing with `frameProcessor` (optional)
+
+`CameraUSB` and `CameraPi2` expose a `frameProcessor` hook — an optional callable that runs on every captured frame before it is streamed. Assign it before or after `start()`.
+
+**Process and stream the edited frame:**
+```python
+def my_pipeline(frame):
+    frame = apply_color_filter(frame)
+    frame = cv2.GaussianBlur(frame, (5, 5), 0)
+    return frame   # edited frame is streamed
+
+camera.frameProcessor = my_pipeline
+```
+
+**Process a copy, stream the original unchanged:**
+```python
+def my_pipeline(frame):
+    processed = frame.copy()
+    do_something_with(processed)   # analyze, log, publish, etc.
+    return frame                   # original streams unchanged
+```
+
+**Drop a frame entirely** (not streamed, not published to ROS) by returning `None`:
+```python
+def my_pipeline(frame):
+    if should_drop(frame):
+        return None   # frame is discarded
+    return frame
+```
+
+**Non-blocking processing** — use a worker thread with a size-1 queue so slow inference never blocks the capture loop:
+```python
+import queue, threading
+
+q = queue.Queue(maxsize=1)
+
+def worker():
+    while True:
+        frame = q.get()
+        if frame is None:
+            break
+        do_something_with(run_inference(frame))
+
+threading.Thread(target=worker, daemon=True).start()
+
+def my_pipeline(frame):
+    try:
+        q.put_nowait(frame.copy())  # drop if worker is still busy
+    except queue.Full:
+        pass
+    return frame   # original always streams without blocking
+
+camera.frameProcessor = my_pipeline
+```
+
+> **Note:** For `CameraUSB`, `frameProcessor` receives the frame *after* digital zoom is applied. Set `camera.frameProcessor = None` to restore pass-through behavior.
+
+---
 
 # Additional Tools
 
