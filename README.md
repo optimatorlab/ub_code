@@ -81,14 +81,14 @@ pip install "aiohttp>=3.9.0"
 
 Make sure you're in the `ub_code` directory, then install:
 
-**Development Mode (Recommended for active development):**
-```bash
-pip install -e .
-```
-
-**Standard Installation:**
+**Standard Installation (Recommended):**
 ```bash
 pip install .
+```
+
+**Development Mode (only for developers):**
+```bash
+pip install -e .
 ```
 
 **With ROS support (optional):**
