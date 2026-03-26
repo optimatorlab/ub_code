@@ -68,25 +68,42 @@ pip install "opencv-contrib-python>=4.10.0"
 
 # Install pyzbar (for barcode/QR code detection)
 pip install "pyzbar>=0.1.9"
+
+# Install websockets (for websocket streaming)
+pip install "websockets>=12.0"
+
+# Install items for WebRTC streaming
+pip install "aiortc>=1.9.0"
+pip install "aiohttp>=3.9.0"
 ```
 
 ### Step 2: Install ub-code Package
 
 Make sure you're in the `ub_code` directory, then install:
 
-**Development Mode (Recommended for active development):**
-```bash
-pip install -e .
-```
-
-**Standard Installation:**
+**Standard Installation (Recommended):**
 ```bash
 pip install .
+```
+
+**Development Mode (only for developers):**
+```bash
+pip install -e .
 ```
 
 **With ROS support (optional):**
 ```bash
 pip install -e ".[ros]"
+```
+
+**With WebSocket streaming support (optional):**
+```bash
+pip install -e ".[websocket]"
+```
+
+**With WebRTC streaming support (optional):**
+```bash
+pip install -e ".[webrtc]"
 ```
 
 After installation, you can import the modules from anywhere on your machine:
@@ -129,12 +146,95 @@ The function compares your installed version against the latest version on the G
 
 ---
 
-## Using Custom SSL Certificates
+## Streaming Protocols
 
-The package includes self-signed SSL certificates for HTTPS streaming (useful for development/testing). To use your own SSL certificates instead:
+`ub_camera` supports three streaming protocols. All use TLS so they can be
+embedded in `https://` pages without mixed-content errors.
+
+| Protocol | Extra install | Typical latency | Browser endpoint | Multi-client |
+|---|---|---|---|---|
+| **MJPEG** (default) | None | 200–500 ms | `https://host:PORT/stream.mjpg` | Yes |
+| **WebSocket + JPEG** | `ub-code[websocket]` | 100–300 ms | See snippet below | Yes |
+| **WebRTC** | `ub-code[webrtc]` | 50–150 ms | `https://host:PORT/webrtc` | Yes |
+
+### MJPEG (default)
+
+No extra dependencies. All existing code continues to work unchanged.
 
 ```python
-# Pass the sslPath parameter when initializing your camera
+camera.startStream(port=8000)                    # default
+camera.startStream(port=8000, protocol='mjpeg')  # explicit
+# Visit https://host:8000/stream.mjpg
+```
+
+### WebSocket + JPEG
+
+```bash
+pip install "ub-code[websocket]"
+```
+
+```python
+camera.startStream(port=8001, protocol='websocket')
+```
+
+Embed in a web page:
+
+```html
+<canvas id="cam" width="640" height="480"></canvas>
+<script>
+  const canvas = document.getElementById('cam');
+  const ctx    = canvas.getContext('2d');
+  const ws     = new WebSocket('wss://camera-host:8001');
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = (e) => {
+    const blob = new Blob([e.data], { type: 'image/jpeg' });
+    createImageBitmap(blob).then(bmp => ctx.drawImage(bmp, 0, 0));
+  };
+</script>
+```
+
+### WebRTC
+
+```bash
+pip install "ub-code[webrtc]"
+```
+
+```python
+camera.startStream(port=8002, protocol='webrtc')
+# Built-in viewer: https://host:8002/webrtc
+```
+
+`GET /webrtc` serves a self-contained HTML+JS page — open it directly in a
+browser with no additional setup. The media stream uses WebRTC DTLS and never
+triggers a TLS certificate warning, regardless of whether the signaling
+endpoint uses a self-signed or trusted cert.
+
+For integration into your own web page, use `signalingMode='json'`:
+
+```python
+camera.startStream(port=8002, protocol='webrtc', signalingMode='json')
+# GET  /webrtc  →  {"offerUrl": "/offer"}
+# POST /offer   accepts {sdp, type}, returns {sdp, type}
+```
+
+### Switching protocols
+
+Only one protocol is active at a time per camera. To switch without stopping
+first, pass `force=True`:
+
+```python
+camera.startStream(port=8002, protocol='webrtc', force=True)
+```
+
+---
+
+## Using Custom SSL Certificates
+
+The package includes self-signed SSL certificates for HTTPS/WSS streaming
+(useful for development and testing). All three streaming protocols use the
+same certificate. To use your own certificates instead:
+
+```python
 camera = ub_camera.CameraUSB(
     paramDict={'res_rows': 480, 'res_cols': 640, 'fps_target': 30},
     sslPath='/path/to/your/ssl/directory'
@@ -142,10 +242,208 @@ camera = ub_camera.CameraUSB(
 ```
 
 Your SSL directory should contain:
-- `ca.crt` - SSL certificate file
-- `ca.key` - SSL private key file
+- `ca.crt` — SSL certificate file
+- `ca.key` — SSL private key file
 
-If you don't specify `sslPath`, the package will automatically use the bundled certificates located in the `ub_camera/ssl/` directory.
+If you don't specify `sslPath`, the package uses the bundled certificates in
+`ub_camera/ssl/`. For deployments where users should not see a browser
+security warning, replace the bundled cert with a trusted one (e.g., from a
+university subdomain or a Let's Encrypt reverse proxy). No code changes are
+needed — only the certificate files change.
+
+---
+
+## Reverse Proxy Deployment (Zero Browser Warnings)
+
+For multi-user deployments where students access camera streams from personal
+machines, a reverse proxy with a trusted certificate eliminates the self-signed
+cert browser warning entirely — with no client-side setup required.
+
+**Key principle:** For WebRTC, the proxy handles only the small signaling
+messages (`GET /webrtc`, `POST /offer`). The actual video stream flows directly
+from the camera device to the browser via WebRTC DTLS — it never touches the
+proxy. Latency is unaffected.
+
+### Architecture
+
+```
+Student browser
+    │  HTTPS signaling (small JSON messages only)
+    ▼
+Reverse proxy   ←── your domain, trusted cert, public/campus network
+    │  forwards to
+    ▼
+Camera device   ←── local network, self-signed cert or plain HTTP internally
+    │  WebRTC media (UDP, direct)
+    └──────────────────────────────────────► Student browser
+```
+
+### Caddy (recommended — automatic HTTPS)
+
+[Caddy](https://caddyserver.com) automatically provisions and renews
+Let's Encrypt certificates. Install it on any internet-accessible server
+(a university VM, cloud instance, etc.).
+
+**`Caddyfile`** — one block per camera device:
+
+```
+cameras.yourdomain.com {
+    # Route each camera to its own subdirectory
+    handle /camera1/* {
+        uri strip_prefix /camera1
+        reverse_proxy camera1-hostname:8002
+    }
+    handle /camera2/* {
+        uri strip_prefix /camera2
+        reverse_proxy camera2-hostname:8002
+    }
+}
+```
+
+Start Caddy:
+```bash
+caddy run --config Caddyfile
+```
+
+Students access the built-in WebRTC viewer at:
+```
+https://cameras.yourdomain.com/camera1/webrtc
+```
+
+The camera devices themselves need no configuration change. Caddy terminates
+TLS on behalf of the camera; internally it can proxy to either HTTP or HTTPS
+(the camera's self-signed cert only needs to be trusted by the proxy, not
+by the student's browser).
+
+To allow Caddy to proxy to the camera's self-signed HTTPS endpoint:
+```
+handle /camera1/* {
+    uri strip_prefix /camera1
+    reverse_proxy camera1-hostname:8002 {
+        transport http {
+            tls_insecure_skip_verify   # proxy trusts camera's self-signed cert
+        }
+    }
+}
+```
+
+Alternatively, run the camera on plain HTTP internally (no SSL) and let
+Caddy provide TLS at the edge — students still get `https://`, and the
+internal hop stays on a trusted LAN:
+
+```python
+# Camera side: serve without SSL (LAN-only, behind the proxy)
+# Not yet supported — use sslPath with a self-signed cert for now,
+# and set tls_insecure_skip_verify on the Caddy block above.
+```
+
+### Apache
+
+Required modules (enable with `a2enmod` on Debian/Ubuntu):
+
+```bash
+sudo a2enmod ssl proxy proxy_http proxy_wstunnel rewrite
+sudo systemctl reload apache2
+```
+
+**VirtualHost config** (`/etc/apache2/sites-available/cameras.conf`):
+
+```apache
+<VirtualHost *:443>
+    ServerName cameras.yourdomain.com
+
+    SSLEngine               On
+    SSLCertificateFile      /etc/ssl/certs/yourdomain.crt
+    SSLCertificateKeyFile   /etc/ssl/private/yourdomain.key
+    # SSLCertificateChainFile /etc/ssl/certs/chain.crt   # if required by your CA
+
+    # Allow proxying to the camera's self-signed HTTPS cert
+    SSLProxyEngine          On
+    SSLProxyVerify          none
+    SSLProxyCheckPeerCN     Off
+    SSLProxyCheckPeerName   Off
+
+    # ---------------------------------------------------------------
+    # Camera 1 — WebRTC (signaling only; media flows direct via UDP)
+    # ---------------------------------------------------------------
+    ProxyPass        /camera1/  https://camera1-hostname:8002/
+    ProxyPassReverse /camera1/  https://camera1-hostname:8002/
+
+    # ---------------------------------------------------------------
+    # Camera 1 — WebSocket streaming (wss://)
+    # ---------------------------------------------------------------
+    RewriteEngine On
+    RewriteCond   %{HTTP:Upgrade} websocket [NC]
+    RewriteCond   %{HTTP:Connection} upgrade [NC]
+    RewriteRule   ^/camera1-ws/(.*)  wss://camera1-hostname:8001/$1  [P,L]
+
+    ProxyPass        /camera1-ws/  wss://camera1-hostname:8001/
+    ProxyPassReverse /camera1-ws/  wss://camera1-hostname:8001/
+
+    # Repeat the above blocks for additional cameras
+    # (camera2 → port 8002, etc.)
+</VirtualHost>
+
+# Redirect plain HTTP to HTTPS
+<VirtualHost *:80>
+    ServerName cameras.yourdomain.com
+    Redirect permanent / https://cameras.yourdomain.com/
+</VirtualHost>
+```
+
+Enable and reload:
+```bash
+sudo a2ensite cameras.conf
+sudo systemctl reload apache2
+```
+
+Students access the built-in WebRTC viewer at:
+```
+https://cameras.yourdomain.com/camera1/webrtc
+```
+
+> **Note on WebSocket path:** Because Apache proxies `/camera1-ws/` to the
+> camera's WebSocket port (8001), the browser's `WebSocket()` URL must use
+> that path prefix:
+> ```js
+> const ws = new WebSocket('wss://cameras.yourdomain.com/camera1-ws/');
+> ```
+> Adjust accordingly if you use a different URL scheme.
+
+### Nginx
+
+For environments where Nginx is already deployed:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name cameras.yourdomain.com;
+
+    ssl_certificate     /etc/ssl/certs/yourdomain.crt;
+    ssl_certificate_key /etc/ssl/private/yourdomain.key;
+
+    location /camera1/ {
+        rewrite ^/camera1/(.*) /$1 break;
+        proxy_pass https://camera1-hostname:8002;
+        proxy_ssl_verify off;          # camera uses self-signed cert
+
+        # Required for WebSocket upgrade (websocket protocol)
+        proxy_http_version  1.1;
+        proxy_set_header    Upgrade    $http_upgrade;
+        proxy_set_header    Connection "upgrade";
+    }
+}
+```
+
+### Access control with the proxy
+
+The camera's `ipAllowlist` / `ipBlocklist` will see the **proxy's IP**, not
+the student's IP, when traffic is forwarded. If per-student IP filtering is
+needed, either:
+- Apply access control at the proxy level (Apache `Require ip`, Caddy
+  `basicauth`, Nginx `allow`/`deny`), or
+- Pass the student's real IP via `X-Forwarded-For` and update the camera
+  access-control logic to read that header (not currently implemented).
 
 ---
 
@@ -192,10 +490,16 @@ camera = ub_camera.CameraUSB(paramDict = paramDict,
                              apiPref = apiPref,
                              showFPS=True)    # False --> Hide frames-per-second in video feed
 
-# Start camera and stream:
+# Start camera and stream (MJPEG default):
 camera.start(startStream=True, port=paramDict['outputPort'])
 
 print(f'Visit https://localhost:{paramDict["outputPort"]}/stream.mjpg')
+
+# Or start with a different protocol after camera.start():
+# camera.startStream(port=paramDict['outputPort'], protocol='websocket')
+# camera.startStream(port=paramDict['outputPort'], protocol='webrtc')
+# print(f'Visit https://localhost:{paramDict["outputPort"]}/webrtc')
+
 print("When you're done, be sure to stop the camera: camera.stop()")
 ```
 - **Before you exit, make sure you stop your camera.**  See code below.
@@ -206,8 +510,67 @@ print("When you're done, be sure to stop the camera: camera.stop()")
 camera.stopStream()
 camera.stop()
 ```
-    
----  
+
+---
+
+### 5.  Per-frame processing with `frameProcessor` (optional)
+
+`CameraUSB` and `CameraPi2` expose a `frameProcessor` hook — an optional callable that runs on every captured frame before it is streamed. Assign it before or after `start()`.
+
+**Process and stream the edited frame:**
+```python
+def my_pipeline(frame):
+    frame = apply_color_filter(frame)
+    frame = cv2.GaussianBlur(frame, (5, 5), 0)
+    return frame   # edited frame is streamed
+
+camera.frameProcessor = my_pipeline
+```
+
+**Process a copy, stream the original unchanged:**
+```python
+def my_pipeline(frame):
+    processed = frame.copy()
+    do_something_with(processed)   # analyze, log, publish, etc.
+    return frame                   # original streams unchanged
+```
+
+**Drop a frame entirely** (not streamed, not published to ROS) by returning `None`:
+```python
+def my_pipeline(frame):
+    if should_drop(frame):
+        return None   # frame is discarded
+    return frame
+```
+
+**Non-blocking processing** — use a worker thread with a size-1 queue so slow inference never blocks the capture loop:
+```python
+import queue, threading
+
+q = queue.Queue(maxsize=1)
+
+def worker():
+    while True:
+        frame = q.get()
+        if frame is None:
+            break
+        do_something_with(run_inference(frame))
+
+threading.Thread(target=worker, daemon=True).start()
+
+def my_pipeline(frame):
+    try:
+        q.put_nowait(frame.copy())  # drop if worker is still busy
+    except queue.Full:
+        pass
+    return frame   # original always streams without blocking
+
+camera.frameProcessor = my_pipeline
+```
+
+> **Note:** For `CameraUSB`, `frameProcessor` receives the frame *after* digital zoom is applied. Set `camera.frameProcessor = None` to restore pass-through behavior.
+
+---
 
 # Additional Tools
 

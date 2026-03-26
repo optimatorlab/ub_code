@@ -6,7 +6,10 @@ and ROS camera topics with extensive computer vision capabilities.
 
 Main Features:
     - Multiple camera backends (USB, Raspberry Pi Camera Module, ROS topics)
-    - HTTP/HTTPS video streaming (MJPEG)
+    - Video streaming over HTTPS — three protocol options:
+        * MJPEG  (default, no extra deps)
+        * WebSocket + JPEG  (pip install ub-code[websocket])
+        * WebRTC            (pip install ub-code[webrtc])
     - ROS topic publishing (compressed and raw images)
     - ArUco marker detection and tracking
     - Barcode/QR code detection
@@ -26,7 +29,9 @@ Classes:
 Dependencies:
     - numpy
     - opencv-contrib-python (for ArUco support)
-    - rospy, cv_bridge, sensor_msgs (optional, for ROS support)
+    - websockets>=12.0          (optional, for WebSocket streaming)
+    - aiortc>=1.9.0, aiohttp>=3.9.0  (optional, for WebRTC streaming)
+    - rospy, cv_bridge, sensor_msgs  (optional, for ROS support)
     - ub_utils (custom utility module)
 
 Basic Usage:
@@ -38,9 +43,16 @@ Basic Usage:
     camera = CameraUSB(paramDict={'res_rows': 480, 'res_cols': 640, 'fps_target': 30})
     camera.start()
 
-    # Start HTTP streaming
+    # Start streaming (MJPEG default — backward compatible)
     camera.startStream(port=8000)
     # Visit https://localhost:8000/stream.mjpg
+
+    # WebSocket streaming (lower latency)
+    camera.startStream(port=8001, protocol='websocket')
+
+    # WebRTC streaming (lowest latency, built-in browser viewer)
+    camera.startStream(port=8002, protocol='webrtc')
+    # Visit https://localhost:8002/webrtc
 
     # Add ArUco marker detection
     camera.addAruco('DICT_APRILTAG_36h11', fps_target=20)
@@ -154,6 +166,7 @@ def checkVersion(verbose=True):
 
 # This stuff is for streaming only:
 # ------------------------------------------------
+import asyncio
 import socketserver
 from functools import partial
 from threading import Condition
@@ -161,6 +174,22 @@ from http import server
 import ssl
 
 STREAM_MAX_WAIT_TIME_SEC = 2  # max time (in seconds) we wait for condition
+
+try:
+	import websockets
+	_HAS_WEBSOCKETS = True
+except ImportError:
+	_HAS_WEBSOCKETS = False
+
+try:
+	import aiohttp
+	import aiohttp.web
+	from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+	from av import VideoFrame
+	_HAS_WEBRTC = True
+except ImportError:
+	_HAS_WEBRTC = False
+	VideoStreamTrack = object   # placeholder so CameraVideoTrack class body is valid
 # ------------------------------------------------
 
 # This stuff is for ROS only:
@@ -2068,7 +2097,306 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
 	allow_reuse_address = True
 	daemon_threads = True
 
-		
+
+class WebSocketStreamingServer:
+	"""Asyncio-based WebSocket server for broadcasting JPEG frames.
+
+	Maintains a set of connected WebSocket clients and broadcasts each new
+	camera frame to all of them as a binary JPEG message. Runs within a
+	single asyncio event loop that lives in its own daemon thread, fully
+	isolated from the main threading model.
+
+	IP allowlist and blocklist are enforced on connection and re-checked
+	on every frame broadcast.
+	"""
+
+	def __init__(self, camObject):
+		"""Initialize the server with a reference to the parent camera.
+
+		Args:
+			camObject: Camera instance providing frameDeque, condition,
+				decorateFrame(), and access-control lists.
+		"""
+		self.camObject = camObject
+		self.clients   = set()   # connected websockets.ServerConnection objects
+
+	def _is_blocked(self, ip):
+		"""Return True if the given IP address should be denied access."""
+		if self.camObject.ipAllowlist and ip not in self.camObject.ipAllowlist:
+			return True
+		if ip in self.camObject.ipBlocklist:
+			return True
+		return False
+
+	async def _handler(self, websocket):
+		"""Manage one client connection lifecycle.
+
+		Called by websockets.serve() for each new connection. Checks IP
+		access, registers the client, and waits for the connection to close.
+		"""
+		client_ip = websocket.remote_address[0]
+		if self._is_blocked(client_ip):
+			await websocket.close(1008, 'Access denied')
+			return
+		self.clients.add(websocket)
+		self.camObject.streamIncr(+1)
+		try:
+			await websocket.wait_closed()
+		finally:
+			self.clients.discard(websocket)
+			self.camObject.streamIncr(-1)
+
+	def _wait_for_frame(self):
+		"""Block until the next frame is ready (runs in a thread-pool executor)."""
+		with self.camObject.condition:
+			return self.camObject.condition.wait(STREAM_MAX_WAIT_TIME_SEC)
+
+	async def _broadcaster(self):
+		"""Encode and broadcast frames to all connected clients until stopped."""
+		loop = asyncio.get_running_loop()
+		while self.camObject.keepStreaming:
+			success = await loop.run_in_executor(None, self._wait_for_frame)
+
+			if not self.camObject.keepStreaming:
+				break
+
+			if not success or not self.clients:
+				continue
+
+			# Per-frame IP re-check: close any newly-blocked clients
+			for ws in list(self.clients):
+				if self._is_blocked(ws.remote_address[0]):
+					self.clients.discard(ws)
+					asyncio.create_task(ws.close(1008, 'Access denied'))
+
+			if not self.clients:
+				continue
+
+			frame_array = np.frombuffer(
+				self.camObject.getFrameCopy(), dtype=np.uint8
+			).reshape(self.camObject.res_rows, self.camObject.res_cols, 3)
+			self.camObject.decorateFrame(frame_array)
+			_, jpeg = cv2.imencode('.jpg', frame_array)
+
+			websockets.broadcast(self.clients, jpeg.tobytes())
+			self.camObject.calcFramerate(self.camObject.fps['stream'], 'stream')
+
+	async def serve(self, port, ssl_context):
+		"""Start the WebSocket server and run the broadcaster until stopped.
+
+		Args:
+			port (int): TCP port to listen on.
+			ssl_context (ssl.SSLContext): TLS context for wss:// connections.
+		"""
+		async with websockets.serve(self._handler, '', port, ssl=ssl_context):
+			await self._broadcaster()
+
+
+# ---------------------------------------------------------------------------
+# WebRTC streaming support
+# ---------------------------------------------------------------------------
+
+_WEBRTC_HTML_PAGE = """\
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ub_camera Stream</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #111; display: flex; flex-direction: column;
+           align-items: center; justify-content: center;
+           min-height: 100vh; font-family: sans-serif; color: #ccc; }
+    video { max-width: 100%; max-height: 90vh; border: 1px solid #333; }
+    #status { margin-top: 8px; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+  <div id="status">Connecting...</div>
+  <script>
+    (async function () {
+      const status = document.getElementById('status');
+      try {
+        const pc = new RTCPeerConnection();
+        pc.addTransceiver('video', { direction: 'recvonly' });
+        pc.ontrack = (e) => {
+          document.getElementById('video').srcObject = e.streams[0];
+        };
+        pc.onconnectionstatechange = () => {
+          status.textContent = pc.connectionState;
+        };
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        const resp = await fetch('/offer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sdp: offer.sdp, type: offer.type })
+        });
+        if (!resp.ok) throw new Error('Offer rejected: ' + resp.status);
+        await pc.setRemoteDescription(await resp.json());
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+        console.error(err);
+      }
+    })();
+  </script>
+</body>
+</html>
+"""
+
+
+class CameraVideoTrack(VideoStreamTrack):
+	"""aiortc VideoStreamTrack that pulls frames from a Camera's frameDeque.
+
+	Each connected WebRTC client gets its own CameraVideoTrack instance, but
+	all instances share the same frameDeque and threading.Condition from the
+	parent Camera. The synchronous condition wait is offloaded to a thread-pool
+	executor so the asyncio event loop is never blocked.
+	"""
+
+	kind = 'video'
+
+	def __init__(self, camObject):
+		"""Initialize the track with a reference to the parent camera.
+
+		Args:
+			camObject: Camera instance providing frameDeque, condition,
+				res_rows, res_cols, decorateFrame(), and calcFramerate().
+		"""
+		super().__init__()
+		self.camObject = camObject
+
+	def _wait_for_frame(self):
+		"""Block until the next frame is ready (runs in a thread-pool executor)."""
+		with self.camObject.condition:
+			self.camObject.condition.wait(STREAM_MAX_WAIT_TIME_SEC)
+
+	async def recv(self):
+		"""Return the next video frame to the WebRTC peer.
+
+		Called repeatedly by aiortc. Waits for a new camera frame without
+		blocking the event loop, decorates it, converts it to an av.VideoFrame,
+		and attaches the correct PTS/time_base before returning.
+		"""
+		pts, time_base = await self.next_timestamp()
+
+		loop = asyncio.get_running_loop()
+		await loop.run_in_executor(None, self._wait_for_frame)
+
+		frame_array = np.frombuffer(
+			self.camObject.getFrameCopy(), dtype=np.uint8
+		).reshape(self.camObject.res_rows, self.camObject.res_cols, 3)
+		self.camObject.decorateFrame(frame_array)
+
+		# OpenCV is BGR; av expects RGB for 'rgb24' format
+		frame_rgb = cv2.cvtColor(frame_array, cv2.COLOR_BGR2RGB)
+		video_frame = VideoFrame.from_ndarray(frame_rgb, format='rgb24')
+		video_frame.pts       = pts
+		video_frame.time_base = time_base
+
+		self.camObject.calcFramerate(self.camObject.fps['stream'], 'stream')
+		return video_frame
+
+
+class WebRTCStreamingServer:
+	"""aiohttp-based signaling server and WebRTC peer manager.
+
+	Serves the SDP offer/answer signaling endpoint over HTTPS and manages the
+	lifecycle of RTCPeerConnection objects — one per connected client. Each
+	connection receives its own CameraVideoTrack, which shares the camera's
+	frameDeque source.
+
+	Routes:
+		GET  /webrtc  — built-in HTML page (signalingMode='html') or
+		                JSON descriptor   (signalingMode='json')
+		POST /offer   — SDP offer/answer exchange; returns JSON answer
+	"""
+
+	def __init__(self, camObject, signalingMode):
+		"""Initialize the server.
+
+		Args:
+			camObject: Camera instance to stream from.
+			signalingMode (str): 'html' to serve a built-in viewer page at
+				GET /webrtc, or 'json' to return a JSON descriptor instead.
+		"""
+		self.camObject     = camObject
+		self.signalingMode = signalingMode
+		self.pcs           = set()   # active RTCPeerConnection objects
+
+	def _is_blocked(self, ip):
+		"""Return True if the given IP address should be denied access."""
+		if self.camObject.ipAllowlist and ip not in self.camObject.ipAllowlist:
+			return True
+		if ip in self.camObject.ipBlocklist:
+			return True
+		return False
+
+	async def _handle_webrtc_page(self, request):
+		"""Serve GET /webrtc — HTML viewer page or JSON descriptor."""
+		if self.signalingMode == 'json':
+			return aiohttp.web.json_response({'offerUrl': '/offer'})
+		return aiohttp.web.Response(content_type='text/html', text=_WEBRTC_HTML_PAGE)
+
+	async def _handle_offer(self, request):
+		"""Handle POST /offer — create a peer connection and return SDP answer."""
+		client_ip = request.remote
+		if self._is_blocked(client_ip):
+			raise aiohttp.web.HTTPForbidden()
+
+		params = await request.json()
+		offer  = RTCSessionDescription(sdp=params['sdp'], type=params['type'])
+
+		pc = RTCPeerConnection()
+		self.pcs.add(pc)
+		self.camObject.streamIncr(+1)
+
+		@pc.on('connectionstatechange')
+		async def on_connectionstatechange():
+			if pc.connectionState in ('failed', 'closed'):
+				if pc in self.pcs:
+					self.pcs.discard(pc)
+					self.camObject.streamIncr(-1)
+				await pc.close()
+
+		pc.addTrack(CameraVideoTrack(self.camObject))
+
+		await pc.setRemoteDescription(offer)
+		answer = await pc.createAnswer()
+		await pc.setLocalDescription(answer)
+
+		return aiohttp.web.json_response({
+			'sdp':  pc.localDescription.sdp,
+			'type': pc.localDescription.type,
+		})
+
+	async def serve(self, port, ssl_context):
+		"""Start the signaling server and run until keepStreaming goes False.
+
+		Args:
+			port (int): TCP port to listen on.
+			ssl_context (ssl.SSLContext): TLS context for https:// connections.
+		"""
+		app = aiohttp.web.Application()
+		app.router.add_get( '/webrtc', self._handle_webrtc_page)
+		app.router.add_post('/offer',  self._handle_offer)
+
+		runner = aiohttp.web.AppRunner(app)
+		await runner.setup()
+		site = aiohttp.web.TCPSite(runner, '', port, ssl_context=ssl_context)
+		await site.start()
+
+		try:
+			while self.camObject.keepStreaming:
+				await asyncio.sleep(0.5)
+		finally:
+			for pc in list(self.pcs):
+				await pc.close()
+			self.pcs.clear()
+			await runner.cleanup()
+
+
 class Camera():
 	"""Base class for all camera implementations in the UB camera framework.
 
@@ -2078,7 +2406,8 @@ class Camera():
 	capture mechanisms while inheriting shared streaming, processing, and publishing capabilities.
 
 	Key Features:
-		- HTTPS video streaming with SSL/TLS support
+		- Video streaming over HTTPS/WSS with SSL/TLS support:
+		  MJPEG (default), WebSocket + JPEG, and WebRTC
 		- ROS topic publishing (raw and compressed image formats)
 		- Computer vision modules: ArUco marker detection, barcode/QR code scanning,
 		  face detection, ROI tracking, camera calibration, Ultralytics YOLO models
@@ -2104,9 +2433,10 @@ class Camera():
 		facedetect (dict): Active face detection instances.
 		ultralytics (dict): Active Ultralytics YOLO model instances.
 		zoomLevel (float): Current digital zoom level (1.0 = no zoom).
-		keepStreaming (bool): Flag to control HTTPS streaming thread.
+		keepStreaming (bool): Flag to control the active streaming thread.
+		activeProtocol (str): Currently active streaming protocol ('mjpeg', 'websocket', 'webrtc'), or None.
 		keepPublishing (bool): Flag to control ROS publishing thread.
-		numStreams (int): Count of active HTTPS stream connections.
+		numStreams (int): Count of active stream connections.
 		frameDeque (deque): Thread-safe deque holding the most recent captured frame.
 		condition (Condition): Threading condition variable for frame synchronization.
 		logger (Logger): Logging instance for recording events and errors.
@@ -2208,8 +2538,9 @@ class Camera():
 
 		self.camOn = False		# FIXME -- Group the flags together
 		
-		self.numStreams	    = 0
-		self.keepStreaming  = False
+		self.numStreams      = 0
+		self.keepStreaming   = False
+		self.activeProtocol = None   # 'mjpeg' | 'websocket' | 'webrtc'
 		
 		self.keepPublishing = False   # _thread_ros
 		self.hasROSnode = False	
@@ -2638,39 +2969,68 @@ class Camera():
 				
 
 						
-	def startStream(self, port):
-		"""Start HTTPS video streaming server on the specified port.
+	def startStream(self, port, protocol='mjpeg', force=False, signalingMode='html'):
+		"""Start a video streaming server on the specified port.
 
-		Launches a threaded HTTPS server that streams camera frames as MJPEG to connected
-		clients. Uses SSL/TLS encryption with certificates from sslPath.
+		Launches a threaded server that streams camera frames to connected clients.
+		Only one protocol may be active at a time. Raises RuntimeError if a stream
+		is already running unless force=True, which stops the current stream first.
 
 		Args:
 			port (int): TCP port number for the streaming server.
+			protocol (str): Streaming protocol. One of 'mjpeg' (default),
+				'websocket', or 'webrtc'.
+			force (bool): If True, stop any currently active stream before starting
+				the new one. Default False.
+			signalingMode (str): WebRTC only. 'html' (default) serves a built-in
+				HTML+JS page at GET /webrtc. 'json' returns a JSON descriptor
+				instead, for integration into custom UIs.
 
 		Notes:
-			- Server runs in a daemon thread and will stop when the main program exits.
+			- Server runs in a daemon thread and stops when the main program exits.
 			- Multiple clients can connect simultaneously (tracked via numStreams).
 			- Frames are decorated with overlays (FPS, ArUco markers, etc.) before streaming.
 			- IP filtering is applied based on ipAllowlist and ipBlocklist.
 		"""
 		try:
-			self.keepStreaming = True
+			_VALID_PROTOCOLS = ('mjpeg', 'websocket', 'webrtc')
+			if protocol not in _VALID_PROTOCOLS:
+				raise ValueError(f"Invalid protocol '{protocol}'. Choose from {_VALID_PROTOCOLS}.")
 
-			strThread = threading.Thread(target=self._thread_stream, args=(port,))
+			if self.keepStreaming:
+				if force:
+					self.stopStream()
+				else:
+					raise RuntimeError(
+						f"A '{self.activeProtocol}' stream is already active on this camera. "
+						"Call stopStream() first, or pass force=True to replace it.")
+
+			self.keepStreaming   = True
+			self.activeProtocol = protocol
+
+			if protocol == 'mjpeg':
+				strThread = threading.Thread(target=self._thread_stream_mjpeg, args=(port,))
+			elif protocol == 'websocket':
+				strThread = threading.Thread(target=self._thread_stream_websocket, args=(port,))
+			elif protocol == 'webrtc':
+				strThread = threading.Thread(target=self._thread_stream_webrtc, args=(port, signalingMode))
+
 			strThread.daemon = True
 			strThread.start()
 		except Exception as e:
-			# raise Exception(f'Error in startStream: {e}')
-			self.keepStreaming = False
+			self.keepStreaming   = False
+			self.activeProtocol = None
 			self.logger.log(f'Error in startStream: {e}.', severity=ub_utils.SEVERITY_ERROR)
 
 	def stopStream(self):
-		"""Stop the HTTPS video streaming server.
+		"""Stop the active video streaming server.
 
-		Sets the keepStreaming flag to False, causing the streaming thread to terminate.
+		Sets keepStreaming to False, causing the streaming thread to terminate,
+		and clears the active protocol.
 		"""
 		try:
-			self.keepStreaming = False
+			self.keepStreaming   = False
+			self.activeProtocol = None
 		except Exception as e:
 			self.logger.log(f'Error in stopStream: {e}.', severity=ub_utils.SEVERITY_ERROR)
 
@@ -3061,17 +3421,17 @@ class Camera():
 			# raise Exception(f'_thread_ros error: {e}')
 			self.logger.log(f'_thread_ros error: {e}.', severity=ub_utils.SEVERITY_ERROR)
 				
-	def _thread_stream(self, portNumber):
+	def _thread_stream_mjpeg(self, portNumber):
 		'''
 		THIS IS A THREAD
-		It starts/runs the streaming server
-		'''			
+		It starts/runs the MJPEG streaming server
+		'''
 		try:
-			try:				
+			try:
 				address = ('', portNumber)
 				handler = partial(StreamingHandler, self)				# self --> This CamUSB instance
-				server = StreamingServer(address, handler)	
-				
+				server = StreamingServer(address, handler)
+
 				# --- make this server secure (ssl/https) ---
 				if ((sys.version_info.major == 3) and (sys.version_info.minor <= 7)):
 					# ssl.wrap_socket was deprecated in Python 3.7
@@ -3079,8 +3439,8 @@ class Camera():
 					server.socket = ssl.wrap_socket(
 						server.socket,
 						keyfile  = f'{self.sslPath}/ca.key',
-						certfile = f'{self.sslPath}/ca.crt',		
-						server_side=True)   
+						certfile = f'{self.sslPath}/ca.crt',
+						server_side=True)
 				else:
 					# This is the newer way:
 					ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -3089,16 +3449,74 @@ class Camera():
 						certfile = f'{self.sslPath}/ca.crt')
 					server.socket = ssl_context.wrap_socket(server.socket, server_side = True)
 				# -------------------------------------------
-				
-				server.serve_forever()	
-					
+
+				server.serve_forever()
+
 			finally:
-				self.logger.log('stopping _thread_stream thread', severity=ub_utils.SEVERITY_INFO)
-				# self.stop()
-					
+				self.logger.log('stopping _thread_stream_mjpeg thread', severity=ub_utils.SEVERITY_INFO)
+
 		except Exception as e:
-			# raise Exception(f'_thread_stream error: {e}')
-			self.logger.log(f'_thread_stream error: {e}.', severity=ub_utils.SEVERITY_ERROR)	
+			self.logger.log(f'_thread_stream_mjpeg error: {e}.', severity=ub_utils.SEVERITY_ERROR)
+
+	def _thread_stream_websocket(self, portNumber):
+		'''
+		THIS IS A THREAD
+		It starts/runs the WebSocket streaming server.
+		'''
+		if not _HAS_WEBSOCKETS:
+			self.logger.log(
+				"WebSocket streaming requires 'websockets'. "
+				"Install with: pip install ub-code[websocket]",
+				severity=ub_utils.SEVERITY_ERROR)
+			self.keepStreaming   = False
+			self.activeProtocol = None
+			return
+
+		try:
+			try:
+				ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+				ssl_context.load_cert_chain(
+					keyfile  = f'{self.sslPath}/ca.key',
+					certfile = f'{self.sslPath}/ca.crt')
+
+				ws_server = WebSocketStreamingServer(self)
+				asyncio.run(ws_server.serve(portNumber, ssl_context))
+
+			finally:
+				self.logger.log('stopping _thread_stream_websocket thread', severity=ub_utils.SEVERITY_INFO)
+
+		except Exception as e:
+			self.logger.log(f'_thread_stream_websocket error: {e}.', severity=ub_utils.SEVERITY_ERROR)
+
+	def _thread_stream_webrtc(self, portNumber, signalingMode):
+		'''
+		THIS IS A THREAD
+		It starts/runs the WebRTC signaling server and manages peer connections.
+		'''
+		if not _HAS_WEBRTC:
+			self.logger.log(
+				"WebRTC streaming requires 'aiortc' and 'aiohttp'. "
+				"Install with: pip install ub-code[webrtc]",
+				severity=ub_utils.SEVERITY_ERROR)
+			self.keepStreaming   = False
+			self.activeProtocol = None
+			return
+
+		try:
+			try:
+				ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+				ssl_context.load_cert_chain(
+					keyfile  = f'{self.sslPath}/ca.key',
+					certfile = f'{self.sslPath}/ca.crt')
+
+				webrtc_server = WebRTCStreamingServer(self, signalingMode)
+				asyncio.run(webrtc_server.serve(portNumber, ssl_context))
+
+			finally:
+				self.logger.log('stopping _thread_stream_webrtc thread', severity=ub_utils.SEVERITY_INFO)
+
+		except Exception as e:
+			self.logger.log(f'_thread_stream_webrtc error: {e}.', severity=ub_utils.SEVERITY_ERROR)	
 			
 			
 	def _zoomFunction_cv2(self, frame):
@@ -3487,7 +3905,7 @@ class CameraPi(Camera):
 			# raise Exception(f'Error in camera shutdown: {e}')
 			self.logger.log(f'Error in camera shutdown: {e}', severity=ub_utils.SEVERITY_ERROR)
 					 
-	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, startStream=False, port=None, imgTopic=None, compImgTopic=None):
+	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, startStream=False, port=None, protocol='mjpeg', imgTopic=None, compImgTopic=None):
 		"""Initialize and start Raspberry Pi camera recording.
 
 		This method creates a picamera.PiCamera instance, configures resolution and framerate,
@@ -3499,8 +3917,10 @@ class CameraPi(Camera):
 			res_rows (int, optional): Image height in pixels. If None, uses value from paramDict.
 			res_cols (int, optional): Image width in pixels. If None, uses value from paramDict.
 			framerate (int, optional): Target framerate in fps. If None, uses value from paramDict.
-			startStream (bool, optional): Whether to start HTTP streaming. Defaults to False.
+			startStream (bool, optional): Whether to start streaming. Defaults to False.
 			port (int, optional): Port number for streaming server. Required if startStream=True.
+			protocol (str, optional): Streaming protocol — 'mjpeg' (default), 'websocket',
+				or 'webrtc'. Only used when startStream=True.
 			imgTopic (str, optional): ROS topic name for publishing raw images.
 			compImgTopic (str, optional): ROS topic name for publishing compressed images.
 
@@ -3513,7 +3933,7 @@ class CameraPi(Camera):
 			- Camera records continuously in BGR format for OpenCV compatibility.
 			- Actual resolution/framerate may differ from requested; check self.res_rows,
 			  self.res_cols, and self.fps_target after start.
-			- Stream uses HTTPS with SSL certificates from self.sslPath.
+			- Stream uses HTTPS/WSS with SSL certificates from self.sslPath.
 		"""
 		try:
 			# If user didn't provide a parameter, use the default value
@@ -3540,9 +3960,9 @@ class CameraPi(Camera):
 			if (startStream):
 				if (port is None):
 					raise Exception('cannot stream when port is None')
-				else:	
-					self.startStream(port)
-			
+				else:
+					self.startStream(port, protocol=protocol)
+
 			# Start publishing to ROS compressed image topic?
 			if ((imgTopic is not None) or (compImgTopic is not None)):
 				self.startROStopic(imgTopic=imgTopic, compImgTopic=compImgTopic)	
@@ -3609,6 +4029,338 @@ class CameraPi(Camera):
 			
 
 		return		
+
+class CameraPi2(Camera):
+	"""Raspberry Pi camera implementation using the picamera2 package.
+
+	This class provides an interface to Raspberry Pi Camera Module hardware using the
+	picamera2 Python library (the successor to picamera). It supports hardware-accelerated
+	video capture, dynamic resolution/framerate changes at runtime, and hardware zoom via
+	the ScalerCrop control.
+
+	Key Differences from CameraPi:
+		- Uses picamera2 library instead of the legacy picamera library
+		- Frames are delivered via a background pull thread calling capture_array("main")
+		  rather than a push callback (write method)
+		- Zoom is implemented via ScalerCrop control using pixel coordinates queried
+		  at runtime from camera_properties["PixelArraySize"]
+		- Framerate is set via FrameDurationLimits control (microseconds)
+		- Headless operation assumed (no preview window)
+
+	Hardware Support:
+		- Raspberry Pi 3B, 4, 5, CM5
+		- Raspberry Pi Camera Module v2 (IMX219)
+		- Raspberry Pi Camera Module v3 (IMX708)
+		- Raspberry Pi High Quality Camera (IMX477)
+
+	Usage Example:
+		>>> cam = CameraPi2()
+		>>> cam.start(res_rows=720, res_cols=1280, framerate=30, startStream=True, port=8000)
+		>>>
+		>>> cam.changeZoom(2.0)
+		>>> cam.changeResolutionFramerate(res_rows=480, res_cols=640, framerate=15)
+		>>> cam.shutdown()
+		>>>
+		>>> # Per-frame CV processing via frameProcessor hook:
+		>>> #   - Return a frame  → appended to frameDeque and streamed.
+		>>> #   - Return None     → frame discarded (not streamed, not published to ROS).
+		>>> #   - frameProcessor = None (default) → pass-through, unchanged behavior.
+		>>>
+		>>> # Process and stream the edited frame:
+		>>> cam = CameraPi2()
+		>>> def my_pipeline(frame):
+		...     frame = apply_color_filter(frame)
+		...     frame = cv2.GaussianBlur(frame, (5, 5), 0)
+		...     return frame        # return edited frame -> it streams
+		...     # return None       # return None -> frame is dropped (not streamed)
+		>>> cam.frameProcessor = my_pipeline
+		>>> cam.start(startStream=True, port=8000)
+		>>>
+		>>> # Process a copy, stream the original unchanged:
+		>>> def my_pipeline(frame):
+		...     processed = frame.copy()
+		...     processed = apply_color_filter(processed)
+		...     do_something_with(processed)
+		...     return frame        # original streams unchanged
+		>>>
+		>>> # Non-blocking processing via worker thread (e.g. for slow inference):
+		>>> # maxsize=1 ensures the worker always sees the latest frame and memory stays bounded.
+		>>> import queue, threading
+		>>> q = queue.Queue(maxsize=1)
+		>>> def worker():
+		...     while True:
+		...         frame = q.get()
+		...         if frame is None: break
+		...         do_something_with(run_inference(frame))
+		>>> threading.Thread(target=worker, daemon=True).start()
+		>>> def my_pipeline(frame):
+		...     try: q.put_nowait(frame.copy())  # drop frame if worker is still busy
+		...     except queue.Full: pass
+		...     return frame        # original always streams without blocking
+
+	Important Notes:
+		- Requires picamera2: installed via apt as python3-picamera2 (tested on v0.3.34)
+		- Only works on Raspberry Pi hardware with camera modules enabled in raspi-config
+		- Headless operation: no preview window is started
+		- Frames are captured as BGR888 for OpenCV compatibility
+
+	Attributes:
+		cap (Picamera2): The Picamera2 instance controlling the hardware.
+		Picamera2 (class): Reference to the imported Picamera2 class.
+		_capture_thread (threading.Thread): Background thread running the frame pull loop.
+		_capture_running (bool): Flag used to signal the capture thread to stop.
+		frameProcessor (callable or None): Optional per-frame hook. Called as
+			frameProcessor(frame) on each captured frame. Return a frame to stream it,
+			or return None to drop the frame (not streamed, not published to ROS).
+	"""
+	def __init__(self, paramDict={'res_rows':480, 'res_cols':640, 'fps_target':30, 'outputPort': 8000},
+				device='/dev/video0', apiPref=cv2.CAP_V4L2, logger=None, sslPath=None, pubCamStatusFunction=None,
+				imgTopic=None, compImgTopic=None, initROSnode=False, showFPS=True, ipAllowlist=[], ipBlocklist=[]):
+		"""Initialize Raspberry Pi camera interface using picamera2.
+
+		Args:
+			paramDict (dict, optional): Configuration dictionary. Defaults to 480x640 @ 30fps.
+				Supported keys: 'res_rows', 'res_cols', 'fps_target', 'outputPort'.
+			device (str, optional): Device path (not used by picamera2). Defaults to '/dev/video0'.
+			apiPref (int, optional): API preference (not used by picamera2). Defaults to cv2.CAP_V4L2.
+			logger (Logger, optional): Logger instance. If None, creates default logger.
+			sslPath (str, optional): Path to SSL certificates for HTTPS streaming.
+			pubCamStatusFunction (callable, optional): Callback function to publish camera status.
+			imgTopic (str, optional): ROS image topic name for publishing raw images.
+			compImgTopic (str, optional): ROS compressed image topic name.
+			initROSnode (bool, optional): Whether to initialize ROS node. Defaults to False.
+			showFPS (bool, optional): Whether to display FPS information. Defaults to True.
+			ipAllowlist (list, optional): List of allowed IP addresses for streaming.
+			ipBlocklist (list, optional): List of blocked IP addresses for streaming.
+
+		Notes:
+			- The device and apiPref parameters are accepted for API consistency but not used.
+			- picamera2 must be installed (apt install python3-picamera2).
+			- Camera hardware must be enabled in raspi-config.
+		"""
+		try:
+			from picamera2 import Picamera2
+			self.Picamera2 = Picamera2
+		except Exception as e:
+			print(f'Failed to init CameraPi2: {e}')
+
+		super().__init__(paramDict, logger, sslPath, pubCamStatusFunction, initROSnode, showFPS, ipAllowlist, ipBlocklist)
+
+		self.cap = None
+		self._capture_thread = None
+		self._capture_running = False
+		self.frameProcessor = None   # optional callable(frame) -> frame | None
+
+	def _startCaptureThread(self):
+		"""Start the background frame capture thread."""
+		self._capture_running = True
+		self._capture_thread = threading.Thread(target=self._captureLoop, daemon=True)
+		self._capture_thread.start()
+
+	def _stopCaptureThread(self, timeout=3.0):
+		"""Signal the capture thread to stop and wait for it to finish.
+
+		Args:
+			timeout (float): Seconds to wait for the thread to join. Defaults to 3.0.
+		"""
+		self._capture_running = False
+		if self._capture_thread is not None:
+			self._capture_thread.join(timeout=timeout)
+			self._capture_thread = None
+
+	def _captureLoop(self):
+		"""Background thread: pull frames from picamera2 and populate frameDeque.
+
+		Calls capture_array("main") in a loop. The call blocks until picamera2
+		delivers the next frame, providing natural pacing without busy-polling.
+		Despite the "RGB888" format label, picamera2 delivers BGR bytes on tested
+		hardware (OV5647/vc4 pipeline), so no conversion is applied.
+
+		If frameProcessor is set, it is called on each frame. Return a frame to
+		stream it, or return None to drop the frame (not streamed, not published to ROS).
+		"""
+		while self._capture_running:
+			try:
+				frame = self.cap.capture_array("main")  # picamera2 delivers BGR despite RGB888 format label
+
+				if self.frameProcessor is not None:
+					frame = self.frameProcessor(frame)
+					if frame is None:
+						continue   # user chose to drop this frame
+
+				self.frameDeque.append(frame)
+				self.announceCondition()
+				self.calcFramerate(self.fps['capture'], 'capture')
+			except Exception as e:
+				self.logger.log(f'Error in CameraPi2 capture loop: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def _changeFramerate(self, req_framerate):
+		try:
+			if req_framerate == self.fps_target:
+				return (True, '')
+
+			if self.fpsMin <= req_framerate <= self.fpsMax:
+				frame_duration_us = int(1e6 / req_framerate)
+				self.cap.set_controls({"FrameDurationLimits": (frame_duration_us, frame_duration_us)})
+				self.updateFramerate(req_framerate)
+				return (True, '')
+			else:
+				return (False, 'picam2 framerate is at limit')
+
+		except Exception as e:
+			return (False, f'Could not change picam2 framerate: {e}')
+
+	def _changeResolution(self, req_height, req_width):
+		try:
+			current_size = self.cap.camera_configuration()["main"]["size"]  # (width, height)
+			if current_size == (req_width, req_height):
+				return (False, f'picam2 resolution is already {req_width}x{req_height}.')
+
+			self._stopCaptureThread()
+			self.cap.stop()
+
+			config = self.cap.create_video_configuration(
+				main={"format": "RGB888", "size": (req_width, req_height)}
+			)
+			self.cap.configure(config)
+			self.cap.start()
+
+			frame_duration_us = int(1e6 / self.fps_target)
+			self.cap.set_controls({"FrameDurationLimits": (frame_duration_us, frame_duration_us)})
+
+			self.updateResolution(req_height, req_width)
+			self._startCaptureThread()
+			return (True, '')
+
+		except Exception as e:
+			return (False, f'Could not change picam2 resolution to {req_width}x{req_height}: {e}.')
+
+	def changeZoom(self, zoomLevel):
+		"""Change camera zoom level using hardware ScalerCrop control.
+
+		Queries the sensor's full pixel array size at runtime and computes a
+		center-crop rectangle corresponding to the requested zoom level. Works
+		across all supported camera modules (IMX219, IMX708, IMX477).
+
+		Args:
+			zoomLevel (float): Zoom level where 1.0 = no zoom, 2.0 = 2x zoom, etc.
+
+		Notes:
+			- Zoom is centered on the frame.
+			- Output resolution remains constant regardless of zoom level.
+			- Maximum zoom is limited by sensor resolution and hardware.
+
+		References:
+			https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf
+		"""
+		try:
+			sensor_w, sensor_h = self.cap.camera_properties["PixelArraySize"]
+			crop_w = int(sensor_w / zoomLevel)
+			crop_h = int(sensor_h / zoomLevel)
+			crop_x = (sensor_w - crop_w) // 2
+			crop_y = (sensor_h - crop_h) // 2
+			self.cap.set_controls({"ScalerCrop": (crop_x, crop_y, crop_w, crop_h)})
+			self.updateZoom(zoomLevel)
+		except Exception as e:
+			self.logger.log(f'Could not change picam2 zoomLevel to {zoomLevel}x: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def changeResolutionFramerate(self, res_rows=None, res_cols=None, framerate=None):
+		"""Change resolution and/or framerate."""
+		try:
+			res_rows  = self.defaultFromNone(res_rows,  self.res_rows,   int)
+			res_cols  = self.defaultFromNone(res_cols,  self.res_cols,   int)
+			framerate = self.defaultFromNone(framerate, self.fps_target, int)
+
+			(successFr,  msgFr)  = self._changeFramerate(framerate)
+			(successRes, msgRes) = self._changeResolution(res_rows, res_cols)
+
+			if ((not successFr) or (not successRes)):
+				raise Exception(f'{msgFr} {msgRes}')
+
+		except Exception as e:
+			self.logger.log(f'Failed to change to {res_rows} rows, {res_cols} cols, {framerate} framerate: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def shutdown(self):
+		"""Shutdown camera and release all resources.
+
+		Stops the capture thread, halts recording, closes the Picamera2 instance,
+		and waits for streaming threads to finish.
+		"""
+		try:
+			if self.cap:
+				self.stop()
+				self.cap.close()
+				time.sleep(STREAM_MAX_WAIT_TIME_SEC + 1)
+		except Exception as e:
+			self.logger.log(f'Error in camera shutdown: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, startStream=False, port=None, protocol='mjpeg', imgTopic=None, compImgTopic=None):
+		"""Initialize and start Raspberry Pi camera using picamera2.
+
+		Creates a Picamera2 instance, configures it for continuous video capture
+		in BGR888 format, starts the hardware, and launches the background capture
+		thread. Optionally starts HTTP streaming and/or ROS topic publishing.
+
+		Args:
+			assetID (str, optional): Asset identifier (not used by CameraPi2).
+			res_rows (int, optional): Image height in pixels. If None, uses value from paramDict.
+			res_cols (int, optional): Image width in pixels. If None, uses value from paramDict.
+			framerate (int, optional): Target framerate in fps. If None, uses value from paramDict.
+			startStream (bool, optional): Whether to start streaming. Defaults to False.
+			port (int, optional): Port number for streaming server. Required if startStream=True.
+			protocol (str, optional): Streaming protocol — 'mjpeg' (default), 'websocket', or 'webrtc'.
+			imgTopic (str, optional): ROS topic name for publishing raw images.
+			compImgTopic (str, optional): ROS topic name for publishing compressed images.
+		"""
+		try:
+			res_rows  = self.defaultFromNone(res_rows,  self.res_rows,   int)
+			res_cols  = self.defaultFromNone(res_cols,  self.res_cols,   int)
+			framerate = self.defaultFromNone(framerate, self.fps_target, int)
+			port      = self.defaultFromNone(port, self.outputPort)
+
+			self.cap = self.Picamera2()
+
+			config = self.cap.create_video_configuration(
+				main={"format": "RGB888", "size": (res_cols, res_rows)}
+			)
+			self.cap.configure(config)
+			self.cap.start()
+
+			frame_duration_us = int(1e6 / framerate)
+			self.cap.set_controls({"FrameDurationLimits": (frame_duration_us, frame_duration_us)})
+
+			# Read back actual configured size
+			actual_size = self.cap.camera_configuration()["main"]["size"]
+			self.updateResolution(actual_size[1], actual_size[0])
+			self.updateFramerate(framerate)  # picamera2 doesn't expose set framerate directly
+
+			self.camOn = True
+			self._startCaptureThread()
+
+			if startStream:
+				if port is None:
+					raise Exception('cannot stream when port is None')
+				else:
+					self.startStream(port, protocol=protocol)
+
+			if (imgTopic is not None) or (compImgTopic is not None):
+				self.startROStopic(imgTopic=imgTopic, compImgTopic=compImgTopic)
+
+			self.reachback_pubCamStatus()
+
+		except Exception as e:
+			self.logger.log(f'Error in camera start: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+	def stop(self):
+		"""Stop camera capture and streaming."""
+		try:
+			self.camOn = False
+			self._stopCaptureThread()
+			self.cap.stop()
+			self.stopStream()
+		except Exception as e:
+			raise Exception(f'Error in camera stop: {e}')
+
 
 class CameraROS(Camera):
 	"""ROS camera subscriber/publisher implementation for compressed image topics.
@@ -3822,17 +4574,19 @@ class CameraROS(Camera):
 		time.sleep(STREAM_MAX_WAIT_TIME_SEC + 1)
 			
 			
-	def start(self, assetID=None, startStream=False, port=None, **kwargs):
+	def start(self, assetID=None, startStream=False, port=None, protocol='mjpeg', **kwargs):
 		"""Start subscribing to ROS CompressedImage topic.
 
 		Creates a ROS subscriber to the configured topic and begins receiving camera frames.
 		Frames arrive via the callback_CompressedImage() callback method. Optionally starts
-		HTTP streaming server to re-broadcast frames.
+		a streaming server to re-broadcast frames.
 
 		Args:
 			assetID (str, optional): Asset identifier to format into topic string (replaces {}).
-			startStream (bool, optional): Whether to start HTTP streaming. Defaults to False.
+			startStream (bool, optional): Whether to start streaming. Defaults to False.
 			port (int, optional): Port number for streaming server. Required if startStream=True.
+			protocol (str, optional): Streaming protocol — 'mjpeg' (default), 'websocket',
+				or 'webrtc'. Only used when startStream=True.
 			**kwargs: Additional keyword arguments (ignored).
 
 		Raises:
@@ -3844,7 +4598,7 @@ class CameraROS(Camera):
 			- If self.topic contains {} placeholder, it's replaced with assetID.
 			- Frames are received asynchronously via callback.
 			- Does not publish to ROS topics (already reading from one).
-			- Stream uses HTTPS with SSL certificates from self.sslPath.
+			- Stream uses HTTPS/WSS with SSL certificates from self.sslPath.
 		"""
 		try:			
 			# If user didn't provide a parameter, use the default value
@@ -3866,8 +4620,8 @@ class CameraROS(Camera):
 			if (startStream):
 				if (port is None):
 					raise Exception('cannot stream when port is None')
-				else:	
-					self.startStream(port)
+				else:
+					self.startStream(port, protocol=protocol)
 			# NOTE: No need to publish to compressed image topic (we're already subscribing to it!)
 
 			self.reachback_pubCamStatus()
@@ -3897,10 +4651,11 @@ class CameraUSB(Camera):
 	Key Differences from Base Camera:
 		- Uses cv2.VideoCapture for frame acquisition
 		- Supports multiple video backends via apiPref parameter (V4L2, FFMPEG, etc.)
-		- Threaded capture via _thread_capture() for continuous frame grabbing
+		- VideoCapture opened synchronously in start(); frame loop runs in _captureLoop()
 		- Digital zoom only (crops and resizes frames in software)
 		- Supports dynamic resolution/framerate changes by restarting capture
 		- Can connect to RTSP/HTTP streams (not just local devices)
+		- Optional frameProcessor hook for per-frame CV processing
 
 	Supported Sources:
 		- USB webcams (e.g., /dev/video0 with V4L2 backend)
@@ -3931,6 +4686,44 @@ class CameraUSB(Camera):
 		>>>
 		>>> # Stop camera
 		>>> cam.shutdown()
+		>>>
+		>>> # Per-frame CV processing via frameProcessor hook:
+		>>> #   - Return a frame  → appended to frameDeque and streamed.
+		>>> #   - Return None     → frame discarded (not streamed, not published to ROS).
+		>>> #   - frameProcessor = None (default) → pass-through, unchanged behavior.
+		>>> # The hook fires after zoomFunction, so the frame is always correctly zoomed.
+		>>>
+		>>> # Process and stream the edited frame:
+		>>> cam = CameraUSB(device='/dev/video0')
+		>>> def my_pipeline(frame):
+		...     frame = apply_color_filter(frame)
+		...     frame = cv2.GaussianBlur(frame, (5, 5), 0)
+		...     return frame        # return edited frame -> it streams
+		...     # return None       # return None -> frame is dropped (not streamed)
+		>>> cam.frameProcessor = my_pipeline
+		>>> cam.start(startStream=True, port=8000)
+		>>>
+		>>> # Process a copy, stream the original unchanged:
+		>>> def my_pipeline(frame):
+		...     processed = frame.copy()
+		...     processed = apply_color_filter(processed)
+		...     do_something_with(processed)
+		...     return frame        # original streams unchanged
+		>>>
+		>>> # Non-blocking processing via worker thread (e.g. for slow inference):
+		>>> # maxsize=1 ensures the worker always sees the latest frame and memory stays bounded.
+		>>> import queue, threading
+		>>> q = queue.Queue(maxsize=1)
+		>>> def worker():
+		...     while True:
+		...         frame = q.get()
+		...         if frame is None: break
+		...         do_something_with(run_inference(frame))
+		>>> threading.Thread(target=worker, daemon=True).start()
+		>>> def my_pipeline(frame):
+		...     try: q.put_nowait(frame.copy())  # drop frame if worker is still busy
+		...     except queue.Full: pass
+		...     return frame        # original always streams without blocking
 
 	Important Notes:
 		- For RTSP/HTTP streams, set apiPref=None to let OpenCV choose backend
@@ -3945,7 +4738,12 @@ class CameraUSB(Camera):
 		device (str): Video source path or URL (e.g., '/dev/video0' or 'rtsp://...').
 		apiPref (int or None): OpenCV VideoCapture API preference (e.g., cv2.CAP_V4L2).
 		fourcc (tuple or None): FOURCC codec as 4-char tuple (e.g., ('M','J','P','G')).
-		cap (cv2.VideoCapture): OpenCV VideoCapture instance.
+		cap (cv2.VideoCapture): OpenCV VideoCapture instance (None when stopped).
+		_capture_thread (threading.Thread): Background thread running the frame pull loop.
+		_capture_running (bool): Flag used to signal the capture thread to stop.
+		frameProcessor (callable or None): Optional per-frame hook. Called as
+			frameProcessor(frame) after zoomFunction. Return a frame to stream it,
+			or return None to drop the frame (not streamed, not published to ROS).
 	"""
 	
 	def __init__(self, paramDict={'res_rows':480, 'res_cols':640, 'fps_target':30, 'outputPort': 8000}, device='/dev/video0',
@@ -3998,120 +4796,70 @@ class CameraUSB(Camera):
 			self.fourcc  = fourcc   
 
 		self.apiPref = apiPref
-		
-		self.cap = None
-				
-				
-	def _thread_capture(self, res_rows, res_cols, framerate, fourcc, device, apiPref):
-		"""Threaded capture loop for continuously grabbing frames from video source.
 
-		This thread creates a cv2.VideoCapture instance, configures it with the specified
-		parameters, and continuously reads frames in a loop. Frames are added to the
-		frame deque for access by other parts of the application. The thread runs until
-		self.camOn is set to False.
+		self.cap = None
+		self._capture_thread  = None
+		self._capture_running = False
+		self.frameProcessor   = None   # optional callable(frame) -> frame | None
+				
+				
+	def _startCaptureThread(self):
+		"""Start the background frame capture thread."""
+		self._capture_running = True
+		self._capture_thread = threading.Thread(target=self._captureLoop, daemon=True)
+		self._capture_thread.start()
+
+	def _stopCaptureThread(self, timeout=3.0):
+		"""Signal the capture thread to stop and wait for it to finish.
 
 		Args:
-			res_rows (int): Requested image height in pixels.
-			res_cols (int): Requested image width in pixels.
-			framerate (int): Requested framerate in fps.
-			fourcc (tuple or None): FOURCC codec as 4-char tuple (e.g., ('M','J','P','G')).
-			device (str): Video source path or URL.
-			apiPref (int or None): OpenCV VideoCapture API preference.
-
-		Notes:
-			- This is a thread method, not meant to be called directly.
-			- Started automatically by start() method.
-			- For RTSP/HTTP streams (apiPref=None), resolution/framerate may be ignored.
-			- For USB cameras (apiPref=cv2.CAP_V4L2), attempts to set resolution/framerate/codec.
-			- Actual resolution/framerate stored in self.res_rows, self.res_cols, self.fps_target.
-			- Continuously grabs frames via cap.read() until self.camOn becomes False.
-			- Each frame has digital zoom applied if zoom level > 1.0.
-			- Frames are appended to self.frameDeque with condition notification.
-			- Automatically releases VideoCapture when loop exits.
+			timeout (float): Seconds to wait for the thread to join. Defaults to 3.0.
 		"""
-		try:	
-			# See https://www.simonwenkel.com/notes/software_libraries/opencv/opencv-frame-io.html 						
-			'''
-			self.cap = cv2.VideoCapture(device, apiPref, 
-									(cv2.CAP_PROP_FPS,          int(framerate), 
-									 cv2.CAP_PROP_FRAME_WIDTH,  int(res_cols),
-									 cv2.CAP_PROP_FRAME_HEIGHT, int(res_rows))) 
-			'''
+		self._capture_running = False
+		if self._capture_thread is not None:
+			self._capture_thread.join(timeout=timeout)
+			self._capture_thread = None
 
-			# Update 2024-02-26.  VOXL cameras use rtsp feeds, which prefer different API and don't use v4l2.
-			# So, for VOXLs, set `apiPref = None`
-			# FIXME -- Might consider using `apiPref = cv2.CAP_FFMPEG`
-			if (apiPref is None):
-				self.cap = cv2.VideoCapture(device)
-			else:
-				params = [cv2.CAP_PROP_FRAME_WIDTH,  int(res_cols), 
-						  cv2.CAP_PROP_FRAME_HEIGHT, int(res_rows), 
-						  cv2.CAP_PROP_FPS,          int(framerate)]
-				if (fourcc is not None):
-					fourcc = cv2.VideoWriter.fourcc(fourcc[0], fourcc[1], fourcc[2], fourcc[3])
-					params.extend([cv2.CAP_PROP_FOURCC, fourcc])
-					
-				self.cap = cv2.VideoCapture(device, apiPref, params=params)
-				'''
-				self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, res_rows)
-				self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  res_cols)
-				self.cap.set(cv2.CAP_PROP_FPS, framerate)
-				self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'))
-				'''
-				
-				# cv2.CAP_PROP_ZOOM, 50.0 does not work on Dell laptop camera
+	def _captureLoop(self):
+		"""Background thread: pull frames from cv2.VideoCapture and populate frameDeque.
 
-				'''
-				See https://www.simonwenkel.com/notes/software_libraries/opencv/opencv-frame-io.html
-				self.cap = cv2.VideoCapture('/dev/video0', cv2.CAP_V4L)
-				self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, res_rows)
-				self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  res_cols)
-				self.cap.set(cv2.CAP_PROP_FPS, framerate)
-				codec = cv2.VideoWriter.fourcc('M','J', 'P','G')
-				self.cap.set(cv2.CAP_PROP_FOURCC, codec)
-				'''
-
-			# FIXME -- Need to verify that the updates actually went thru
-			self.updateResolution(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT), self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) 
-			self.updateFramerate(self.cap.get(cv2.CAP_PROP_FPS))
-			
-			# self.logger.log(f'_thread_capture: {res_rows}, {res_cols}, {framerate}', severity=ub_utils.SEVERITY_DEBUG)
-
-		except Exception as e:
-			# raise Exception(f'CameraUSB capture thread Failed: {e}')
-			self.logger.log(f'CameraUSB capture thread Failed: {e}', severity=ub_utils.SEVERITY_ERROR)
-			
-		else:	
+		Runs until _capture_running is False or VideoCapture closes unexpectedly.
+		Applies zoomFunction to each frame, then passes the result to frameProcessor
+		(if set). If frameProcessor returns None the frame is dropped — it is not
+		appended to frameDeque and therefore not streamed or published to ROS.
+		"""
+		while self._capture_running:
 			try:
-				print(f'Camera Opened? {self.cap.isOpened()}')
-				while(self.cap.isOpened()):
-					ret, frame = self.cap.read()
-					
-					if (ret):
-						# Are we zooming?
-						frame = self.zoomFunction(frame)
+				if not self.cap.isOpened():
+					self.logger.log('CameraUSB: VideoCapture closed unexpectedly', severity=ub_utils.SEVERITY_ERROR)
+					break
 
-						self.frameDeque.append(frame)					
+				ret, frame = self.cap.read()
+				if not ret:
+					continue
 
-						self.announceCondition()
-						
-						self.calcFramerate(self.fps['capture'], 'capture')
-										
-					if (not self.camOn):
-						self.cap.release()
-						break
+				frame = self.zoomFunction(frame)
 
-				# If we make it here, unset our flag:
-				self.camOn = False
+				if self.frameProcessor is not None:
+					frame = self.frameProcessor(frame)
+					if frame is None:
+						continue   # user chose to drop this frame
+
+				self.frameDeque.append(frame)
+				self.announceCondition()
+				self.calcFramerate(self.fps['capture'], 'capture')
+
 			except Exception as e:
-				self.logger.log(f'Ugh - Extra exception in _thread_capture: {e}', severity=ub_utils.SEVERITY_ERROR)
+				self.logger.log(f'Error in CameraUSB capture loop: {e}', severity=ub_utils.SEVERITY_ERROR)
+
+		self.camOn = False
 				
 			
-	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, device=None, apiPref=None, startStream=False, port=None, imgTopic=None, compImgTopic=None):
-		"""Start camera capture thread and optionally start streaming/publishing.
+	def start(self, assetID=None, res_rows=None, res_cols=None, framerate=None, device=None, apiPref=None, startStream=False, port=None, protocol='mjpeg', imgTopic=None, compImgTopic=None):
+		"""Start camera capture and optionally start streaming/publishing.
 
-		Creates and starts a daemon thread running _thread_capture() which opens the video
-		source and continuously grabs frames. Optionally starts HTTP streaming server and/or
+		Opens and configures cv2.VideoCapture synchronously, then launches the
+		background capture thread. Optionally starts a streaming server and/or
 		ROS topic publishing.
 
 		Args:
@@ -4121,64 +4869,87 @@ class CameraUSB(Camera):
 			framerate (int, optional): Target framerate in fps. If None, uses value from paramDict.
 			device (str, optional): Video source path/URL. If None, uses value from __init__.
 			apiPref (int or None, optional): OpenCV API preference. If None, uses value from __init__.
-			startStream (bool, optional): Whether to start HTTP streaming. Defaults to False.
+			startStream (bool, optional): Whether to start streaming. Defaults to False.
 			port (int, optional): Port number for streaming server. Required if startStream=True.
+			protocol (str, optional): Streaming protocol — 'mjpeg' (default), 'websocket',
+				or 'webrtc'. Only used when startStream=True.
 			imgTopic (str, optional): ROS topic name for publishing raw images.
 			compImgTopic (str, optional): ROS topic name for publishing compressed images.
 
 		Raises:
+			Exception: If VideoCapture fails to open.
 			Exception: If startStream=True but port=None.
-			Exception: If camera cannot be opened or configured.
 
 		Notes:
-			- Sets self.camOn = True to signal capture thread to run.
-			- Capture thread is a daemon thread (exits when main program exits).
+			- VideoCapture is opened synchronously; failures are logged immediately.
 			- For RTSP/HTTP streams, actual resolution/framerate may differ from requested.
-			- Stream uses HTTPS with SSL certificates from self.sslPath.
+			- Stream uses HTTPS/WSS with SSL certificates from self.sslPath.
 			- Frames become available in frameDeque shortly after start() returns.
 		"""
 		try:
-			self.camOn = True
-			
 			# If user didn't provide a parameter, use the default value
-			self.res_rows     = self.defaultFromNone(res_rows, self.res_rows, int)
-			self.res_cols     = self.defaultFromNone(res_cols, self.res_cols, int)
-			self.framerate    = self.defaultFromNone(framerate, self.fps_target, int)
-			self.device       = self.defaultFromNone(device, self.device)
-			self.apiPref      = self.defaultFromNone(apiPref, self.apiPref)
-			self.port         = self.defaultFromNone(port, self.outputPort)
-			# compImgTopic =
+			self.res_rows  = self.defaultFromNone(res_rows,  self.res_rows,  int)
+			self.res_cols  = self.defaultFromNone(res_cols,  self.res_cols,  int)
+			self.framerate = self.defaultFromNone(framerate, self.fps_target, int)
+			self.device    = self.defaultFromNone(device,    self.device)
+			self.apiPref   = self.defaultFromNone(apiPref,   self.apiPref)
+			self.port      = self.defaultFromNone(port,      self.outputPort)
 
-			# Start capturing
-			capThread = threading.Thread(target=self._thread_capture, args=(self.res_rows, self.res_cols, self.framerate, self.fourcc, self.device, self.apiPref,))
-			capThread.daemon = True
-			capThread.start()
+			# Open and configure VideoCapture synchronously.
+			# VOXL cameras use RTSP feeds that prefer the default backend, so
+			# apiPref=None skips the V4L2/DSHOW path entirely.
+			# See https://www.simonwenkel.com/notes/software_libraries/opencv/opencv-frame-io.html
+			if self.apiPref is None:
+				self.cap = cv2.VideoCapture(self.device)
+			else:
+				params = [cv2.CAP_PROP_FRAME_WIDTH,  int(self.res_cols),
+						  cv2.CAP_PROP_FRAME_HEIGHT, int(self.res_rows),
+						  cv2.CAP_PROP_FPS,          int(self.framerate)]
+				if self.fourcc is not None:
+					fourcc_code = cv2.VideoWriter.fourcc(self.fourcc[0], self.fourcc[1], self.fourcc[2], self.fourcc[3])
+					params.extend([cv2.CAP_PROP_FOURCC, fourcc_code])
+				self.cap = cv2.VideoCapture(self.device, self.apiPref, params=params)
+
+			if not self.cap.isOpened():
+				raise Exception(f'cv2.VideoCapture failed to open: {self.device}')
+
+			# Read back what the driver actually configured
+			# FIXME -- Need to verify that the updates actually went thru
+			self.updateResolution(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT), self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+			self.updateFramerate(self.cap.get(cv2.CAP_PROP_FPS))
+
+			self.camOn = True
+			self._startCaptureThread()
 
 			# Start streaming?
-			if (startStream):
-				if (self.port is None):
+			if startStream:
+				if self.port is None:
 					raise Exception('cannot stream when port is None')
-				else:	
-					self.startStream(self.port)
-								
-			# Start publishing to ROS compressed image topic?
-			if ((imgTopic is not None) or (compImgTopic is not None)):
-				self.startROStopic(imgTopic=imgTopic, compImgTopic=compImgTopic)	
+				self.startStream(self.port, protocol=protocol)
 
+			# Start publishing to ROS compressed image topic?
+			if (imgTopic is not None) or (compImgTopic is not None):
+				self.startROStopic(imgTopic=imgTopic, compImgTopic=compImgTopic)
 
 			self.reachback_pubCamStatus()
 		except Exception as e:
 			self.logger.log(f'Error in camera start: {e}', severity=ub_utils.SEVERITY_ERROR)
 	
 	def stop(self, stopStream=True):
-		'''
-		Stop capture thread
-		Stop capturing numpy array?
-		'''
-		self.camOn = False	
-		
-		# We may choose not to stop the stream if we are changing resolution/framerate.	
-		if (stopStream):
+		"""Stop the capture thread and release VideoCapture.
+
+		Args:
+			stopStream (bool): Whether to also stop the streaming server.
+				Set False when changing resolution/framerate mid-stream.
+		"""
+		self.camOn = False
+		self._stopCaptureThread()
+		if self.cap is not None:
+			self.cap.release()
+			self.cap = None
+
+		# We may choose not to stop the stream if we are changing resolution/framerate.
+		if stopStream:
 			self.stopStream()
 		
 	def shutdown(self):
@@ -4218,30 +4989,28 @@ class CameraUSB(Camera):
 			res_rows  = self.defaultFromNone(res_rows,  self.res_rows,   int)
 			res_cols  = self.defaultFromNone(res_cols,  self.res_cols,   int)
 			framerate = self.defaultFromNone(framerate, self.fps_target, int)
-			
-			if (hasattr(self, 'fpsMin') and hasattr(self, 'fpsMax')):
-				if ((framerate < self.fpsMin) or (framerate > self.fpsMax)):
-					raise Exception(f'framerate {framerate} ouside of [{self.fpsMin},{self.fpsMin}] bounds.')
-				
-			if ((framerate != self.cap.get(cv2.CAP_PROP_FPS)) or 
-				(res_rows  != self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 
-				(res_cols  != self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))):
-				
+
+			if hasattr(self, 'fpsMin') and hasattr(self, 'fpsMax'):
+				if not (self.fpsMin <= framerate <= self.fpsMax):
+					raise Exception(f'framerate {framerate} outside of [{self.fpsMin},{self.fpsMax}] bounds.')
+
+			# Compare against stored attributes (cap may be None after stop())
+			if (framerate != self.fps_target or
+					res_rows != self.res_rows or
+					res_cols != self.res_cols):
+
 				# Need to stop/release camera to make updates.
-				# However, don't stop the stream (if it is running)
+				# However, don't stop the stream (if it is running).
 				self.stop(stopStream=False)
 				time.sleep(1)
 
-				# Now, we'll re-start the thread, re-initializing camera with new params:
+				# Re-start, re-opening VideoCapture with new params.
+				# start() reads back actuals from the driver and calls updateResolution/updateFramerate.
 				self.start(res_rows=res_rows, res_cols=res_cols, framerate=framerate)
-			
-			# FIXME -- Need to verify that the updates actually went thru
-			self.updateResolution(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT), self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) 
-			self.updateFramerate(self.cap.get(cv2.CAP_PROP_FPS))
 
 			fourccText = self.fourcc2text()
 			self.logger.log(f'rows: {self.res_rows}, cols: {self.res_cols}, framerate: {framerate}', severity=ub_utils.SEVERITY_DEBUG)
-			
+
 		except Exception as e:
 			self.logger.log(f'Failed to change to {res_rows} rows, {res_cols} cols, {framerate} framerate: {e}', severity=ub_utils.SEVERITY_ERROR)
 
