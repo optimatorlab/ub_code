@@ -4061,6 +4061,12 @@ class CameraPi2(Camera):
 		>>> cam.changeResolutionFramerate(res_rows=480, res_cols=640, framerate=15)
 		>>> cam.shutdown()
 		>>>
+		>>> # Two cameras on the same Pi, streaming on different ports:
+		>>> cam0 = CameraPi2(camID=0)
+		>>> cam0.start(startStream=True, port=8000)
+		>>> cam1 = CameraPi2(camID=1)
+		>>> cam1.start(startStream=True, port=8001)
+		>>>
 		>>> # Per-frame CV processing via frameProcessor hook:
 		>>> #   - Return a frame  → appended to frameDeque and streamed.
 		>>> #   - Return None     → frame discarded (not streamed, not published to ROS).
@@ -4114,13 +4120,15 @@ class CameraPi2(Camera):
 			or return None to drop the frame (not streamed, not published to ROS).
 	"""
 	def __init__(self, paramDict={'res_rows':480, 'res_cols':640, 'fps_target':30, 'outputPort': 8000},
-				device='/dev/video0', apiPref=cv2.CAP_V4L2, logger=None, sslPath=None, pubCamStatusFunction=None,
+				camID=0, device='/dev/video0', apiPref=cv2.CAP_V4L2, logger=None, sslPath=None, pubCamStatusFunction=None,
 				imgTopic=None, compImgTopic=None, initROSnode=False, showFPS=True, ipAllowlist=[], ipBlocklist=[]):
 		"""Initialize Raspberry Pi camera interface using picamera2.
 
 		Args:
 			paramDict (dict, optional): Configuration dictionary. Defaults to 480x640 @ 30fps.
 				Supported keys: 'res_rows', 'res_cols', 'fps_target', 'outputPort'.
+			camID (int, optional): Camera index passed to Picamera2. Use 0 for the first
+				camera, 1 for the second, etc. Defaults to 0.
 			device (str, optional): Device path (not used by picamera2). Defaults to '/dev/video0'.
 			apiPref (int, optional): API preference (not used by picamera2). Defaults to cv2.CAP_V4L2.
 			logger (Logger, optional): Logger instance. If None, creates default logger.
@@ -4135,6 +4143,7 @@ class CameraPi2(Camera):
 
 		Notes:
 			- The device and apiPref parameters are accepted for API consistency but not used.
+			- camID is unique to CameraPi2 (passed to Picamera2).
 			- picamera2 must be installed (apt install python3-picamera2).
 			- Camera hardware must be enabled in raspi-config.
 		"""
@@ -4146,6 +4155,7 @@ class CameraPi2(Camera):
 
 		super().__init__(paramDict, logger, sslPath, pubCamStatusFunction, initROSnode, showFPS, ipAllowlist, ipBlocklist)
 
+		self.camID = camID
 		self.cap = None
 		self._capture_thread = None
 		self._capture_running = False
@@ -4318,7 +4328,7 @@ class CameraPi2(Camera):
 			framerate = self.defaultFromNone(framerate, self.fps_target, int)
 			port      = self.defaultFromNone(port, self.outputPort)
 
-			self.cap = self.Picamera2()
+			self.cap = self.Picamera2(self.camID)
 
 			config = self.cap.create_video_configuration(
 				main={"format": "RGB888", "size": (res_cols, res_rows)}
