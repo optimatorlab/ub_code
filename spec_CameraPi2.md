@@ -35,7 +35,7 @@ Two new instance attributes (not in `CameraPi`):
 
 ### `__init__`
 
-Identical signature to `CameraPi.__init__`.
+Identical signature to `CameraPi.__init__`, with one addition: `camID=0` (unique to `CameraPi2`, passed to `Picamera2`).
 
 ```
 try:
@@ -46,6 +46,7 @@ except Exception as e:
 
 super().__init__(...)
 
+self.camID = camID
 self.cap = None
 self._capture_thread = None
 self._capture_running = False
@@ -59,7 +60,7 @@ Identical signature to `CameraPi.start()`.
 
 Steps:
 1. Resolve defaults via `defaultFromNone` (same as CameraPi).
-2. Instantiate `Picamera2()`.
+2. Instantiate `Picamera2(self.camID)`.
 3. Compute `frame_duration_us = int(1e6 / framerate)`.
 4. Build video config:
    ```python
@@ -260,6 +261,7 @@ Inherit from base `Camera` class (grabs latest frame from `frameDeque`). No over
 - Error handling style — mirrors existing `CameraPi` pattern.
 - `assetID` parameter — accepted, not used (same as `CameraPi`).
 - `device` and `apiPref` parameters — accepted, not used (same as `CameraPi`).
+- `camID` parameter — unique to `CameraPi2`; passed to `Picamera2()` to select the camera index.
 
 ---
 
