@@ -2607,6 +2607,38 @@ class Camera():
 		else:
 			return {}
 
+	def setIntrinsics(self, res, fx, fy, cx, cy, dist):
+		"""Set or update camera intrinsics for a given resolution.
+
+		Builds the 3x3 camera matrix from the provided focal length and principal
+		point values, converts the distortion coefficients to a numpy array, and
+		stores both under the given resolution key in self.intrinsics.
+
+		Args:
+			res (str): Resolution key in 'WIDTHxHEIGHT' format (e.g., '640x480').
+			fx (float): Focal length in the x direction, in pixels.
+			fy (float): Focal length in the y direction, in pixels.
+			cx (float): Principal point x-coordinate (horizontal optical center), in pixels.
+			cy (float): Principal point y-coordinate (vertical optical center), in pixels.
+			dist (list or array-like): Distortion coefficients in OpenCV order.
+				Supported lengths:
+				- 4:  [k1, k2, p1, p2]
+				- 5:  [k1, k2, p1, p2, k3]  (most common)
+				- 8:  [k1, k2, p1, p2, k3, k4, k5, k6]
+				- 12: [k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4]
+				- 14: [k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4, tx, ty]
+
+		Example:
+			>>> cam.setIntrinsics('640x480', fx=664.11, fy=666.96, cx=323.10, cy=235.34,
+			...                   dist=[0.0541, -1.545, 0.003, -0.002, 5.536])
+		"""
+		self.intrinsics[res] = {
+			'matrix': np.array([[fx,  0.0, cx ],
+								[0.0, fy,  cy ],
+								[0.0, 0.0, 1.0]]),
+			'dist':   np.array(dist)
+		}
+
 	def _init_ros_node(self):
 		try:
 			rospy.init_node('ub_camera', anonymous=True)
