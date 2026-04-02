@@ -2541,6 +2541,8 @@ class Camera():
 		self.numStreams      = 0
 		self.keepStreaming   = False
 		self.activeProtocol = None   # 'mjpeg' | 'websocket' | 'webrtc'
+		self.streamPort     = None
+		self.streamURL      = None
 		
 		self.keepPublishing = False   # _thread_ros
 		self.hasROSnode = False	
@@ -3039,6 +3041,15 @@ class Camera():
 
 			self.keepStreaming   = True
 			self.activeProtocol = protocol
+			self.streamPort     = port
+
+			_ip = ub_utils.getIP()
+			if protocol == 'mjpeg':
+				self.streamURL = f'https://{_ip}:{port}/stream.mjpg'
+			elif protocol == 'websocket':
+				self.streamURL = f'wss://{_ip}:{port}/'
+			elif protocol == 'webrtc':
+				self.streamURL = f'https://{_ip}:{port}/webrtc'
 
 			if protocol == 'mjpeg':
 				strThread = threading.Thread(target=self._thread_stream_mjpeg, args=(port,))
@@ -3052,6 +3063,8 @@ class Camera():
 		except Exception as e:
 			self.keepStreaming   = False
 			self.activeProtocol = None
+			self.streamPort     = None
+			self.streamURL      = None
 			self.logger.log(f'Error in startStream: {e}.', severity=ub_utils.SEVERITY_ERROR)
 
 	def stopStream(self):
@@ -3063,6 +3076,8 @@ class Camera():
 		try:
 			self.keepStreaming   = False
 			self.activeProtocol = None
+			self.streamPort     = None
+			self.streamURL      = None
 		except Exception as e:
 			self.logger.log(f'Error in stopStream: {e}.', severity=ub_utils.SEVERITY_ERROR)
 

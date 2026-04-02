@@ -910,6 +910,35 @@ def checkPort(port):
         s.close()
         return False
         
+def getIP():
+	"""Return the machine's primary outbound IP address.
+
+	Uses a UDP socket to query the OS routing table without sending any data,
+	which reliably identifies the IP address of the network interface that would
+	be used for outbound traffic. Falls back to '127.0.0.1' if the lookup fails
+	(e.g., no network interfaces are available).
+
+	Returns:
+		str: The local IP address (e.g., '192.168.1.42'), or '127.0.0.1' on failure.
+
+	Notes:
+		- Works on Windows, macOS, and Linux.
+		- Does not send any network traffic.
+
+	Example:
+		>>> import ub_utils
+		>>> ub_utils.getIP()
+		'192.168.1.42'
+	"""
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	try:
+		s.connect(('10.255.255.255', 1))
+		return s.getsockname()[0]
+	except Exception:
+		return '127.0.0.1'
+	finally:
+		s.close()
+
 def findOpenPort(port, options=range(8000,8011)):
 	# port is our preferred port
 	# options is a list of acceptable alternative ports
