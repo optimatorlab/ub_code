@@ -2030,7 +2030,7 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 					 
 	def do_GET(self):
 		# print(f'DEBUG: path? {self.path}')
-		print(f'DEBUG: clientIP: {self.client_address}')
+		# print(f'DEBUG: clientIP: {self.client_address}')
 		if (len(self.camObject.ipAllowlist) > 0):
 			if (self.client_address[0] not in self.camObject.ipAllowlist):
 				self._error()
@@ -2077,6 +2077,8 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 						self.wfile.write(b'\r\n')
 						
 						self.camObject.calcFramerate(self.camObject.fps['stream'], 'stream')
+			except (BrokenPipeError, ConnectionResetError, ssl.SSLEOFError):
+				self.camObject.streamIncr(-1)
 			except Exception as e:
 				print("ERROR in do_GET: {}".format(e))
 				self.camObject.streamIncr(-1)
