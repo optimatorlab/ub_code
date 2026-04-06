@@ -4965,22 +4965,22 @@ class CameraUSB(Camera):
 			self.port      = self.defaultFromNone(port,      self.outputPort)
 
 			# Open and configure VideoCapture synchronously.
-			# Stream sources (RTSP, HTTP, etc.) use the FFMPEG backend which does not support
-			# the params= argument; resolution/framerate are fixed by the server and read back
-			# after open. Local devices (USB cameras, integer indices) pass params at open time.
+			# Stream sources (RTSP, HTTP, etc.) are opened without configuration; resolution and
+			# framerate are fixed server-side and read back after open. Local devices use cap.set()
+			# after open, which is universally supported across all backends.
 			# See https://www.simonwenkel.com/notes/software_libraries/opencv/opencv-frame-io.html
 			_STREAM_PREFIXES = ('rtsp://', 'rtp://', 'http://', 'https://', 'udp://')
 			_is_stream = isinstance(self.device, str) and self.device.startswith(_STREAM_PREFIXES)
 			if _is_stream:
 				self.cap = cv2.VideoCapture(self.device, self.apiPref)
 			else:
-				params = [cv2.CAP_PROP_FRAME_WIDTH,  int(self.res_cols),
-						  cv2.CAP_PROP_FRAME_HEIGHT, int(self.res_rows),
-						  cv2.CAP_PROP_FPS,          int(self.framerate)]
+				self.cap = cv2.VideoCapture(self.device, self.apiPref)
+				self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  int(self.res_cols))
+				self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.res_rows))
+				self.cap.set(cv2.CAP_PROP_FPS,          int(self.framerate))
 				if self.fourcc is not None:
 					fourcc_code = cv2.VideoWriter.fourcc(self.fourcc[0], self.fourcc[1], self.fourcc[2], self.fourcc[3])
-					params.extend([cv2.CAP_PROP_FOURCC, fourcc_code])
-				self.cap = cv2.VideoCapture(self.device, self.apiPref, params=params)
+					self.cap.set(cv2.CAP_PROP_FOURCC, fourcc_code)
 
 			if not self.cap.isOpened():
 				raise Exception(f'cv2.VideoCapture failed to open: {self.device}')
