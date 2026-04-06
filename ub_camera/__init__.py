@@ -4719,8 +4719,8 @@ class CameraUSB(Camera):
 	Supported Sources:
 		- USB webcams (e.g., /dev/video0 with V4L2 backend)
 		- Raspberry Pi cameras on Ubuntu (e.g., /dev/video0)
-		- RTSP streams (e.g., rtsp://192.168.1.100:8554/stream with apiPref=None)
-		- HTTP MJPEG streams (e.g., https://localhost:8000/stream.mjpg with apiPref=None)
+		- RTSP streams (e.g., rtsp://192.168.1.100:8554/stream with apiPref=cv2.CAP_ANY)
+		- HTTP MJPEG streams (e.g., https://localhost:8000/stream.mjpg with apiPref=cv2.CAP_ANY)
 		- Video files (supported by OpenCV)
 		- VOXL camera feeds (RTSP)
 
@@ -4730,7 +4730,7 @@ class CameraUSB(Camera):
 		>>> cam.start(res_rows=720, res_cols=1280, framerate=30, startStream=True, port=8000)
 		>>>
 		>>> # RTSP stream from VOXL or IP camera
-		>>> cam = CameraUSB(device='rtsp://192.168.1.100:8554/stream', apiPref=None)
+		>>> cam = CameraUSB(device='rtsp://192.168.1.100:8554/stream')
 		>>> cam.start(startStream=True, port=8001)
 		>>>
 		>>> # Get frame and save photo
@@ -4785,8 +4785,8 @@ class CameraUSB(Camera):
 		...     return frame        # original always streams without blocking
 
 	Important Notes:
-		- For RTSP/HTTP streams, set apiPref=None to let OpenCV choose backend
-		- For USB cameras on Linux, use apiPref=cv2.CAP_V4L2 for best performance
+		- For RTSP/HTTP streams, use the default apiPref=cv2.CAP_ANY
+		- For USB cameras on Linux, override with apiPref=cv2.CAP_V4L2 for best performance
 		- Resolution/framerate changes restart the capture thread (brief interruption)
 		- Not all cameras support all resolutions or framerates
 		- FOURCC codec can be specified for compatible cameras (e.g., 'MJPG')
@@ -4795,7 +4795,7 @@ class CameraUSB(Camera):
 
 	Attributes:
 		device (str): Video source path or URL (e.g., '/dev/video0' or 'rtsp://...').
-		apiPref (int or None): OpenCV VideoCapture API preference (e.g., cv2.CAP_V4L2).
+		apiPref (int): OpenCV VideoCapture API preference (e.g., cv2.CAP_ANY, cv2.CAP_V4L2).
 		fourcc (tuple or None): FOURCC codec as 4-char tuple (e.g., ('M','J','P','G')).
 		cap (cv2.VideoCapture): OpenCV VideoCapture instance (None when stopped).
 		_capture_thread (threading.Thread): Background thread running the frame pull loop.
@@ -4806,7 +4806,7 @@ class CameraUSB(Camera):
 	"""
 	
 	def __init__(self, paramDict={'res_rows':480, 'res_cols':640, 'fps_target':30, 'outputPort': 8000}, device='/dev/video0',
-		apiPref=cv2.CAP_V4L2, fourcc=None, logger=None, sslPath=None, pubCamStatusFunction=None, imgTopic=None, compImgTopic=None,
+		apiPref=cv2.CAP_ANY, fourcc=None, logger=None, sslPath=None, pubCamStatusFunction=None, imgTopic=None, compImgTopic=None,
 		initROSnode=False, showFPS=True, ipAllowlist=[], ipBlocklist=[]):
 		"""Initialize USB camera or video stream interface.
 
@@ -4818,11 +4818,12 @@ class CameraUSB(Camera):
 				- 'rtsp://192.168.1.100:8554/stream' for RTSP stream
 				- 'https://localhost:8000/stream.mjpg' for HTTP stream
 				Defaults to '/dev/video0'.
-			apiPref (int or None, optional): OpenCV VideoCapture API preference.
-				- cv2.CAP_V4L2 for Linux USB cameras (recommended)
+			apiPref (int, optional): OpenCV VideoCapture API preference.
+				- cv2.CAP_ANY to let OpenCV auto-detect the backend (default, works on all platforms)
+				- cv2.CAP_V4L2 for Linux USB cameras (best performance on Linux)
 				- cv2.CAP_DSHOW for Windows cameras
-				- None to let OpenCV auto-detect (for RTSP/HTTP streams)
-				Defaults to cv2.CAP_V4L2.
+				A warning is logged if a stream URL is provided with a backend other than cv2.CAP_ANY.
+				Defaults to cv2.CAP_ANY.
 			fourcc (tuple or None, optional): FOURCC codec as 4-character tuple,
 				e.g., ('M','J','P','G') for MJPEG. If None, uses camera default.
 			logger (Logger, optional): Logger instance. If None, creates default logger.
@@ -4838,7 +4839,7 @@ class CameraUSB(Camera):
 		Notes:
 			- Does not open camera in __init__ (use start() to begin capture).
 			- device and fourcc can also be specified in paramDict.
-			- For RTSP/HTTP streams, set apiPref=None for better compatibility.
+			- For RTSP/HTTP streams, use the default apiPref=cv2.CAP_ANY.
 			- FOURCC codec support depends on camera hardware and drivers.
 		"""
 
@@ -4854,7 +4855,16 @@ class CameraUSB(Camera):
 		if (not hasattr(self, 'fourcc')):
 			self.fourcc  = fourcc   
 
+		if apiPref is None:
+			apiPref = cv2.CAP_ANY
 		self.apiPref = apiPref
+
+		_STREAM_PREFIXES = ('rtsp://', 'rtp://', 'http://', 'https://', 'udp://')
+		if self.apiPref != cv2.CAP_ANY and isinstance(self.device, str) and self.device.startswith(_STREAM_PREFIXES):
+			self.logger.log(
+				f'apiPref={self.apiPref} was specified but device appears to be a stream URL. '
+				'Consider using the default apiPref=cv2.CAP_ANY for stream sources.',
+				severity=ub_utils.SEVERITY_WARNING)
 
 		self.cap = None
 		self._capture_thread  = None
@@ -4955,19 +4965,14 @@ class CameraUSB(Camera):
 			self.port      = self.defaultFromNone(port,      self.outputPort)
 
 			# Open and configure VideoCapture synchronously.
-			# VOXL cameras use RTSP feeds that prefer the default backend, so
-			# apiPref=None skips the V4L2/DSHOW path entirely.
 			# See https://www.simonwenkel.com/notes/software_libraries/opencv/opencv-frame-io.html
-			if self.apiPref is None:
-				self.cap = cv2.VideoCapture(self.device)
-			else:
-				params = [cv2.CAP_PROP_FRAME_WIDTH,  int(self.res_cols),
-						  cv2.CAP_PROP_FRAME_HEIGHT, int(self.res_rows),
-						  cv2.CAP_PROP_FPS,          int(self.framerate)]
-				if self.fourcc is not None:
-					fourcc_code = cv2.VideoWriter.fourcc(self.fourcc[0], self.fourcc[1], self.fourcc[2], self.fourcc[3])
-					params.extend([cv2.CAP_PROP_FOURCC, fourcc_code])
-				self.cap = cv2.VideoCapture(self.device, self.apiPref, params=params)
+			params = [cv2.CAP_PROP_FRAME_WIDTH,  int(self.res_cols),
+					  cv2.CAP_PROP_FRAME_HEIGHT, int(self.res_rows),
+					  cv2.CAP_PROP_FPS,          int(self.framerate)]
+			if self.fourcc is not None:
+				fourcc_code = cv2.VideoWriter.fourcc(self.fourcc[0], self.fourcc[1], self.fourcc[2], self.fourcc[3])
+				params.extend([cv2.CAP_PROP_FOURCC, fourcc_code])
+			self.cap = cv2.VideoCapture(self.device, self.apiPref, params=params)
 
 			if not self.cap.isOpened():
 				raise Exception(f'cv2.VideoCapture failed to open: {self.device}')

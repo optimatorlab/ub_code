@@ -482,7 +482,7 @@ port = ub_utils.findOpenPort(8000, options=range(8000,8040))
 # Define input device, image size, frames-per-second, etc:
 device    = 0      # or 'https://10.83.17.66:8002/stream.mjpg' or '/dev/video0'
 paramDict = {'res_rows':480, 'res_cols':640, 'fps_target':30, 'outputPort': port}
-apiPref   = None   # on linux try cv2.CAP_V4L2 
+apiPref   = cv2.CAP_ANY   # on linux try cv2.CAP_V4L2 
 
 # Initialize `CameraUSB` class, using default SSL certs
 camera = ub_camera.CameraUSB(paramDict = paramDict, 
