@@ -262,7 +262,7 @@ The method is replaced entirely by `_startCaptureThread()`, `_stopCaptureThread(
 
 | Risk | Mitigation |
 |---|---|
-| RTSP / HTTP sources (apiPref=None) | Handled by same `if apiPref is None` branch, now in `start()`. No logic change. |
+| RTSP / HTTP sources (apiPref=cv2.CAP_ANY) | Default backend; params are passed but silently ignored by stream sources. Actual resolution/framerate read back after open. |
 | USB / V4L2 sources with fourcc | fourcc setup preserved verbatim, moved to `start()`. |
 | `zoomFunction` per frame | Preserved in `_captureLoop()` as first transform before frameProcessor. |
 | `cap.release()` ownership | Moved to `stop()` explicitly; removed from loop body. `self.cap = None` after release prevents double-release. |
