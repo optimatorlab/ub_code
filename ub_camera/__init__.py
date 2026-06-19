@@ -2517,6 +2517,11 @@ class Camera():
 		for k, v in paramDict.items():
 			setattr(self, k, v)
 
+		# outputPort is used by all subclass start() methods as the default streaming port.
+		# Guard here so callers that omit it from paramDict don't get an AttributeError.
+		if not hasattr(self, 'outputPort'):
+			self.outputPort = None
+
 		# Create dictionaries of camera intrinsics, if info was in paramDict.
 		# self.intrinsics['640x480']['matrix'] and self.intrinsics['640x480']['dist']
 		# Or, self.intrinsics = {}
