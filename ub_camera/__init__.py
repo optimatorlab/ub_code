@@ -2544,6 +2544,11 @@ class Camera():
 		self.condition = Condition()		# FIXME -- Can we call this self.frameReadyCondition?  NOTE:  This is referenced by camAutoTakePic...If you change names check there, too.
 
 		self.frameDeque = deque(maxlen=1)
+		# Timestamp of the most recent real frame append — a genuine "is the
+		# stream currently alive" signal (see lastFrameAge()). None until the
+		# first frame arrives, or forever on subclasses whose capture loop
+		# doesn't update it (currently only CameraUSB does).
+		self._lastFrameTime = None
 
 		self.camOn = False		# FIXME -- Group the flags together
 		
@@ -3246,6 +3251,22 @@ class Camera():
 		return img	       	
 	
 	
+	def lastFrameAge(self):
+		"""Seconds since the most recent real frame was captured, or None if
+		no frame has ever arrived (or this subclass's capture loop doesn't
+		update _lastFrameTime — currently only CameraUSB does).
+
+		This is a genuine "is the stream currently alive" signal — deliberately
+		NOT the same thing as camOn (which only reflects whether the
+		underlying capture object itself has been torn down; a stalled stream
+		where reads keep silently failing can leave camOn True forever) or the
+		fps dicts' .actual field (which only recomputes periodically and goes
+		stale itself during a stall, rather than dropping to reflect one).
+		"""
+		if self._lastFrameTime is None:
+			return None
+		return time.time() - self._lastFrameTime
+
 	def calcFramerate(self, fpsDict, threadType=None):
 		'''
 		Find the effective framerate for 'capture', 'stream', or 'publish'.
@@ -3743,6 +3764,105 @@ class Camera():
 		
 			
 
+
+
+	def recordVideoLocal(self, path=None, filename=None, fps=15, colorOption=None, resOption=None):
+		"""Start recording frames from this camera to a local .mp4 file in a background thread.
+
+		Args:
+			path (str, optional): Directory path where video will be saved. If None, saves to
+				current working directory. Directory is created if it doesn't exist.
+			filename (str, optional): Video filename (without path). If None, generates a
+				timestamp-based filename in format 'YYYY-MM-DD_HH-MM-SS.mp4'.
+			fps (int, optional): Target recording framerate (frames pulled from getFrameCopy()
+				at this rate, not necessarily the camera's own native framerate). Defaults to 15.
+			colorOption (str, optional): Color transformation (see getFrameCopy). Default None.
+			resOption (tuple, optional): Target resolution as (width, height) (see getFrameCopy).
+				Default None.
+
+		Returns:
+			tuple: (path, filename) if recording started, (None, None) if error occurred
+				(e.g. no frame available yet to determine video dimensions).
+
+		Notes:
+			- Recording runs in a background thread until stopRecordVideoLocal() is called.
+			- Video is written in mp4 (mp4v fourcc) format using cv2.VideoWriter.
+			- Only one recording may be active at a time per Camera instance — call
+				stopRecordVideoLocal() before starting another.
+		"""
+		try:
+			if getattr(self, '_videoRecordThread', None) is not None:
+				self.logger.log('recordVideoLocal: a recording is already in progress on this camera', severity=ub_utils.SEVERITY_WARNING)
+				return (None, None)
+
+			firstFrame = self.getFrameCopy(colorOption=colorOption, resOption=resOption)
+			if firstFrame is None:
+				self.logger.log('recordVideoLocal: no frame available yet', severity=ub_utils.SEVERITY_ERROR)
+				return (None, None)
+
+			if (filename is None):
+				myTimestamp = datetime.datetime.today()
+				filename = "{}.mp4".format(myTimestamp.strftime('%Y-%m-%d_%H-%M-%S'))
+			else:
+				filename = filename.strip()
+
+			if (path is None):
+				path = ''
+				pathAndFile = f'{filename}'
+			else:
+				path = ub_utils.setEndingChar(path, '/')
+				pathAndFile = f'{path}{filename}'
+
+			if (not os.path.exists(path)):
+				os.makedirs(path, exist_ok=True)
+
+			h, w = firstFrame.shape[:2]
+			fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+			writer = cv2.VideoWriter(pathAndFile, fourcc, fps, (w, h))
+
+			self._videoRecordStopEvent = threading.Event()
+			self._videoRecordThread = threading.Thread(
+				target=self._recordVideoLocalLoop,
+				args=(writer, fps, colorOption, resOption),
+				daemon=True,
+			)
+			self._videoRecordThread.start()
+
+			print(f'Recording video to: {pathAndFile}')
+			return (path, filename)
+
+		except Exception as e:
+			self.logger.log(f'Error starting video recording: {e}', severity=ub_utils.SEVERITY_ERROR)
+			return (None, None)
+
+	def _recordVideoLocalLoop(self, writer, fps, colorOption, resOption):
+		"""Background thread body for recordVideoLocal(). Not asyncio —
+		cv2.VideoWriter.write() is a blocking call, same reasoning ub_camera
+		already uses for its own _captureLoop() background thread."""
+		interval = 1.0 / fps
+		try:
+			while not self._videoRecordStopEvent.is_set():
+				frame = self.getFrameCopy(colorOption=colorOption, resOption=resOption)
+				if frame is not None:
+					writer.write(frame)
+				self._videoRecordStopEvent.wait(interval)
+		finally:
+			writer.release()
+
+	def stopRecordVideoLocal(self, timeout=5.0):
+		"""Stop a recording started by recordVideoLocal() and finalize the video file.
+
+		Safe to call even if no recording is in progress (no-op).
+		"""
+		stopEvent = getattr(self, '_videoRecordStopEvent', None)
+		if stopEvent is None:
+			return
+		stopEvent.set()
+		thread = getattr(self, '_videoRecordThread', None)
+		if thread is not None:
+			thread.join(timeout=timeout)
+		self._videoRecordStopEvent = None
+		self._videoRecordThread = None
 
 
 class CameraPi(Camera):
@@ -5195,6 +5315,7 @@ class CameraUSB(Camera):
 						continue   # user chose to drop this frame
 
 				self.frameDeque.append(frame)
+				self._lastFrameTime = time.time()
 				self.announceCondition()
 				self.calcFramerate(self.fps['capture'], 'capture')
 
