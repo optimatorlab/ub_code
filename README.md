@@ -1,5 +1,33 @@
 # ub-code: Unified Camera Interface and Utilities
 
+> ## ⚠️ This repository is archived and superseded by `olab_code`
+>
+> `ub_camera`/`ub_utils` have been renamed and moved to
+> **[optimatorlab/olab_code](https://github.com/optimatorlab/olab_code)**
+> as `olab_camera`/`olab_utils`. This repo is frozen — no further fixes,
+> features, or security patches will be made here. All active development
+> happens in `olab_code`.
+>
+> **If you're starting something new, install from `olab_code` instead:**
+> ```bash
+> pip install "olab-camera @ git+https://github.com/optimatorlab/olab_code.git@main#subdirectory=packages/olab_camera"
+> pip install "olab-utils @ git+https://github.com/optimatorlab/olab_code.git@main#subdirectory=packages/olab_utils"
+> ```
+> The API is the same in almost all cases — mainly just `import ub_camera` →
+> `import olab_camera` (and `ub_utils` → `olab_utils`). One notable removal:
+> `ub_camera.checkVersion()` doesn't exist in `olab_camera` (it compared
+> against this repo's old auto-bumped version scheme, which doesn't apply
+> under `olab_code`'s pinned-Git-commit dependency model) — print
+> `olab_camera.__version__` / `olab_utils.__version__` instead if you want to
+> see what's installed.
+>
+> Everything below this notice describes the old `ub_code` package and is
+> kept for historical reference — it still applies to `olab_camera`/
+> `olab_utils` almost word-for-word if you mentally substitute the package
+> names, but treat `olab_code`'s own docs as authoritative going forward.
+
+---
+
 This package provides comprehensive camera interfaces (`ub_camera`) and utility functions (`ub_utils`) from Optimator Lab.
 
 ## Installation
